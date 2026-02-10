@@ -1,0 +1,1693 @@
+"""Universal Context CLI — main entry point."""
+
+from __future__ import annotations
+
+import asyncio
+import json as json_mod
+import os
+import signal
+from pathlib import Path
+from typing import Any
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from . import __version__, get_uc_home
+
+app = typer.Typer(
+    name="uc",
+    help="Universal Context — operational memory engine for AI agents",
+    add_completion=False,
+    invoke_without_command=True,
+)
+console = Console()
+
+# --- Sub-command groups ---
+
+daemon_app = typer.Typer(help="Manage the UC daemon (watcher + worker)")
+app.add_typer(daemon_app, name="daemon")
+
+checkpoint_app = typer.Typer(help="Create, list, and restore checkpoints")
+app.add_typer(checkpoint_app, name="checkpoint")
+
+share_app = typer.Typer(help="Export and import share bundles")
+app.add_typer(share_app, name="share")
+
+config_app = typer.Typer(help="View and modify configuration")
+app.add_typer(config_app, name="config")
+
+scope_app = typer.Typer(help="Manage project scopes")
+app.add_typer(scope_app, name="scope")
+
+memory_app = typer.Typer(help="Project working memory")
+app.add_typer(memory_app, name="memory")
+
+
+# --- Async helper ---
+
+def _run_async(coro):
+    """Run an async function from sync CLI context."""
+    return asyncio.run(coro)
+
+
+def _get_db():
+    """Get a database connection for CLI commands."""
+    from .config import UCConfig
+    from .db.client import UCDatabase
+
+    config = UCConfig.load()
+    if config.db_url:
+        return UCDatabase.from_url(config.db_url, config.db_user, config.db_pass)
+    return UCDatabase.from_path(Path(config.resolved_db_path))
+
+
+# --- Serialization helper ---
+
+
+def _sanitize_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Convert SurrealDB RecordID objects to strings for JSON output."""
+    sanitized: dict[str, Any] = {}
+    for k, v in record.items():
+        if hasattr(v, "__class__") and "RecordID" in type(v).__name__:
+            sanitized[k] = str(v)
+        elif isinstance(v, dict):
+            sanitized[k] = _sanitize_record(v)
+        elif isinstance(v, list):
+            sanitized[k] = [
+                _sanitize_record(i) if isinstance(i, dict)
+                else str(i) if hasattr(i, "__class__") and "RecordID" in type(i).__name__
+                else i
+                for i in v
+            ]
+        else:
+            sanitized[k] = v
+    return sanitized
+
+
+# --- Top-level commands ---
+
+
+@app.callback()
+def main(ctx: typer.Context) -> None:
+    """UC — operational memory for AI agents."""
+    if ctx.invoked_subcommand is None:
+        console.print(f"[bold]Universal Context[/bold] v{__version__}")
+        console.print("Run [cyan]uc --help[/cyan] for available commands.")
+
+
+@app.command()
+def init() -> None:
+    """Set up UC home directory (~/.uc/) and default config."""
+    from .config import get_default_config_content
+
+    uc_home = get_uc_home()
+
+    for subdir in ["data", "blobs", "shares"]:
+        (uc_home / subdir).mkdir(parents=True, exist_ok=True)
+
+    config_path = uc_home / "config.yaml"
+    if not config_path.exists():
+        config_path.write_text(get_default_config_content(), encoding="utf-8")
+        console.print(f"[green]Created config:[/green] {config_path}")
+    else:
+        console.print(f"[dim]Config already exists:[/dim] {config_path}")
+
+    console.print(f"[green]UC home ready:[/green] {uc_home}")
+
+
+@app.command()
+def version() -> None:
+    """Show version information."""
+    console.print(f"Universal Context v{__version__}")
+
+
+@app.command()
+def doctor() -> None:
+    """Health check — verify DB, adapters, and daemon status."""
+    import shutil
+
+    console.print("[bold]Universal Context Doctor[/bold]\n")
+
+    uc_home = get_uc_home()
+    _check("UC home exists", uc_home.exists())
+
+    config_path = uc_home / "config.yaml"
+    _check("Config file exists", config_path.exists())
+
+    try:
+        import surrealdb  # noqa: F401
+        _check("SurrealDB SDK installed", True)
+    except ImportError:
+        _check("SurrealDB SDK installed", False)
+
+    _check("tmux available", shutil.which("tmux") is not None)
+
+    from .config import UCConfig
+    config = UCConfig.load()
+    keys = {
+        "OpenRouter": config.get_api_key("openrouter"),
+        "OpenAI": config.get_api_key("openai"),
+        "Anthropic": config.get_api_key("anthropic"),
+    }
+    has_any = any(keys.values())
+    for name, key in keys.items():
+        if key:
+            _check(f"{name} API key", True)
+        elif has_any:
+            console.print(f"  [dim]SKIP[/dim]  {name} API key")
+        else:
+            _check(f"{name} API key", False)
+
+    pid_file = uc_home / "daemon.pid"
+    if pid_file.exists():
+        pid = pid_file.read_text().strip()
+        console.print(f"  [cyan]Daemon PID:[/cyan] {pid}")
+    else:
+        console.print("  [dim]Daemon: not running[/dim]")
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="Search query"),
+    project: Path | None = typer.Option(
+        None, "--project", "-p", help="Scope search to a project path"
+    ),
+    kind: str | None = typer.Option(None, "--kind", "-k", help="Filter by artifact kind"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Full-text search across artifacts."""
+
+    async def _search():
+        from .db.queries import search_artifacts
+        from .db.schema import apply_schema
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+
+            scope_id = None
+            if project is not None:
+                project_path = str(project.resolve())
+                scope = await _resolve_scope(db, project_path)
+                if scope:
+                    scope_id = str(scope["id"])
+
+            results = await search_artifacts(
+                db, query, kind=kind, limit=limit, scope_id=scope_id,
+            )
+
+            if json_output:
+                sanitized = [_sanitize_record(r) for r in results]
+                print(json_mod.dumps(sanitized, default=str))
+                return
+
+            if not results:
+                console.print("[dim]No results found.[/dim]")
+                return
+
+            table = Table(title=f"Search: {query}")
+            table.add_column("ID", style="cyan")
+            table.add_column("Kind", style="green")
+            table.add_column("Content", max_width=60)
+            for r in results:
+                content = r.get("content", "")[:60]
+                table.add_row(str(r["id"]), r.get("kind", ""), content)
+            console.print(table)
+        finally:
+            await db.close()
+
+    _run_async(_search())
+
+
+@app.command()
+def timeline(
+    run_id: str | None = typer.Argument(None, help="Run ID (omit for latest)"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Show chronological timeline of a run."""
+
+    async def _timeline():
+        from .db.queries import list_runs, list_turns
+        from .db.schema import apply_schema
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+
+            if run_id is None:
+                runs = await list_runs(db, limit=1)
+                if not runs:
+                    if json_output:
+                        print(json_mod.dumps(
+                            {"error": "no_runs", "message": "No runs found"}
+                        ))
+                    else:
+                        console.print("[dim]No runs found.[/dim]")
+                    return
+                rid = str(runs[0]["id"])
+            else:
+                rid = run_id
+
+            turns = await list_turns(db, rid)
+
+            if json_output:
+                print(json_mod.dumps({
+                    "run_id": rid,
+                    "turns": [_sanitize_record(t) for t in turns],
+                }, default=str))
+                return
+
+            if not turns:
+                console.print(f"[dim]No turns in run {rid}.[/dim]")
+                return
+
+            table = Table(title=f"Timeline: {rid}")
+            table.add_column("#", style="cyan", justify="right")
+            table.add_column("User Message", max_width=50)
+            table.add_column("Started", style="dim")
+            for t in turns:
+                msg = (t.get("user_message") or "")[:50]
+                ts = str(t.get("started_at", ""))[:19]
+                table.add_row(str(t.get("sequence", "")), msg, ts)
+            console.print(table)
+        finally:
+            await db.close()
+
+    _run_async(_timeline())
+
+
+@app.command()
+def inspect(
+    turn_id: str = typer.Argument(..., help="Turn ID to inspect"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Show turn details, artifacts, and provenance."""
+
+    async def _inspect():
+        from .db.queries import get_provenance_chain, get_turn, get_turn_artifacts
+        from .db.schema import apply_schema
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+            turn = await get_turn(db, turn_id)
+            if not turn:
+                if json_output:
+                    print(json_mod.dumps(
+                        {"error": "not_found", "turn_id": turn_id}
+                    ))
+                    return
+                console.print(f"[red]Turn not found:[/red] {turn_id}")
+                raise typer.Exit(code=1)
+
+            artifacts = await get_turn_artifacts(db, turn_id)
+            chain = await get_provenance_chain(db, turn_id)
+
+            if json_output:
+                # Flatten artifact IDs from graph traversal
+                artifact_ids = []
+                for a in (artifacts or []):
+                    produced = a.get("->produced", {})
+                    if isinstance(produced, dict):
+                        for aid in produced.get("->artifact", []):
+                            artifact_ids.append(str(aid))
+
+                print(json_mod.dumps({
+                    **_sanitize_record(turn),
+                    "artifacts": artifact_ids,
+                    "provenance": [_sanitize_record(c) for c in chain] if chain else [],
+                }, default=str))
+                return
+
+            console.print(f"[bold]Turn {turn_id}[/bold]\n")
+            console.print(f"  Run: {turn.get('run')}")
+            console.print(f"  Sequence: {turn.get('sequence')}")
+            console.print(f"  User: {turn.get('user_message', '(none)')}")
+            console.print(f"  Started: {turn.get('started_at')}")
+
+            if artifacts:
+                console.print("\n[bold]Artifacts:[/bold]")
+                for a in artifacts:
+                    produced = a.get("->produced", {})
+                    ids = produced.get("->artifact", [])
+                    for aid in ids:
+                        console.print(f"  - {aid}")
+
+            if chain:
+                console.print("\n[bold]Provenance:[/bold]")
+                console.print(f"  {chain}")
+        finally:
+            await db.close()
+
+    _run_async(_inspect())
+
+
+@app.command()
+def status(
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Show overview: scopes, runs, job counts."""
+
+    async def _status():
+        from .db.queries import count_jobs_by_status, list_runs, list_scopes
+        from .db.schema import apply_schema
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+
+            scopes = await list_scopes(db)
+            runs = await list_runs(db, limit=5)
+            jobs = await count_jobs_by_status(db)
+
+            if json_output:
+                print(json_mod.dumps({
+                    "scopes": [_sanitize_record(s) for s in scopes],
+                    "recent_runs": [_sanitize_record(r) for r in runs],
+                    "jobs": jobs,
+                }, default=str))
+                return
+
+            console.print(f"[bold]Scopes:[/bold] {len(scopes)}")
+            for s in scopes[:5]:
+                console.print(f"  {s['id']}  {s['name']}  {s.get('path', '')}")
+
+            console.print(f"\n[bold]Recent runs:[/bold] {len(runs)}")
+            for r in runs:
+                console.print(
+                    f"  {r['id']}  {r.get('agent_type', '')}  "
+                    f"[{'green' if r.get('status') == 'active' else 'dim'}]"
+                    f"{r.get('status', '')}[/]"
+                )
+
+            if jobs:
+                console.print(f"\n[bold]Jobs:[/bold] {jobs}")
+        finally:
+            await db.close()
+
+    _run_async(_status())
+
+
+@app.command()
+def context(
+    project: Path | None = typer.Option(
+        None, "--project", "-p", help="Project path (default: cwd)"
+    ),
+    query: str | None = typer.Option(
+        None, "--query", "-q", help="Keyword search query"
+    ),
+    ctx: str | None = typer.Option(
+        None, "--context", "-c",
+        help="Semantic context — describe what you're working on for embedding-based retrieval",
+    ),
+    limit: int = typer.Option(5, "--limit", "-n", help="Max runs to show"),
+    turns: int = typer.Option(10, "--turns", "-t", help="Max turns per run"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Pull context from past sessions for the current project.
+
+    Use --context for semantic search (embedding-based), --query for keyword search (BM25).
+    Both can be combined. --context requires an OpenAI or OpenRouter API key.
+    """
+
+    async def _context():
+        from .db.queries import (
+            get_turn_summaries,
+            list_runs,
+            search_artifacts,
+        )
+        from .db.schema import apply_schema
+
+        project_path = str((project or Path(".")).resolve())
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+
+            scope = await _resolve_scope(db, project_path)
+            if not scope:
+                payload = {
+                    "error": "no_scope",
+                    "project": project_path,
+                    "message": f"No scope found for {project_path}",
+                }
+                if json_output:
+                    print(json_mod.dumps(payload))
+                else:
+                    console.print(
+                        f"[yellow]No scope found for:[/yellow] {project_path}"
+                    )
+                return
+
+            scope_id = str(scope["id"])
+            runs_data = await list_runs(db, scope_id=scope_id, limit=limit)
+
+            # Build run details with summaries
+            run_details = []
+            for r in runs_data:
+                rid = str(r["id"])
+                summaries = await get_turn_summaries(db, rid, limit=turns)
+                run_details.append({
+                    "run_id": rid,
+                    "agent_type": r.get("agent_type", ""),
+                    "status": r.get("status", ""),
+                    "started_at": r.get("started_at"),
+                    "total_turns": len(summaries),
+                    "turns": summaries,
+                })
+
+            # Optional keyword search (scope-filtered)
+            keyword_results = []
+            if query:
+                raw = await search_artifacts(
+                    db, query, kind="summary", scope_id=scope_id,
+                )
+                keyword_results = [_sanitize_record(sr) for sr in raw]
+
+            # Optional semantic search (scope-filtered)
+            semantic_results = []
+            if ctx:
+                semantic_results = await _semantic_search(
+                    db, ctx, query, scope_id=scope_id,
+                )
+
+            if json_output:
+                print(json_mod.dumps({
+                    "scope": _sanitize_record(scope),
+                    "runs": run_details,
+                    "search_results": keyword_results,
+                    "semantic_results": semantic_results,
+                }, default=str))
+                return
+
+            # Rich output
+            console.print(
+                f"[bold]Scope:[/bold] {scope.get('name')} "
+                f"[dim]({scope.get('path')})[/dim]\n"
+            )
+
+            if not run_details:
+                console.print("[dim]No runs found for this scope.[/dim]")
+                return
+
+            for rd in run_details:
+                console.print(
+                    f"[bold]{rd['run_id']}[/bold]  "
+                    f"{rd['agent_type']}  "
+                    f"[{'green' if rd['status'] == 'active' else 'dim'}]"
+                    f"{rd['status']}[/]"
+                )
+                for t in rd["turns"]:
+                    msg = (t.get("user_message") or "")[:40]
+                    summary = (t.get("summary") or "[no summary]")[:60]
+                    console.print(f"  [cyan]#{t['sequence']}[/cyan] {msg}")
+                    console.print(f"    [dim]{summary}[/dim]")
+                console.print()
+
+            if keyword_results:
+                console.print(f"[bold]Keyword results for '{query}':[/bold]")
+                for sr in keyword_results:
+                    console.print(
+                        f"  {sr.get('id')}  {sr.get('content', '')[:60]}"
+                    )
+
+            if semantic_results:
+                console.print(
+                    f"\n[bold]Semantic matches for context:[/bold] "
+                    f"[dim]({ctx[:40]}...)[/dim]" if ctx and len(ctx) > 40
+                    else "\n[bold]Semantic matches:[/bold]"
+                )
+                for sr in semantic_results:
+                    score = sr.get("score", 0)
+                    content = sr.get("content", "")[:60]
+                    console.print(
+                        f"  [cyan]{score:.3f}[/cyan]  {sr.get('id')}  {content}"
+                    )
+
+        finally:
+            await db.close()
+
+    _run_async(_context())
+
+
+async def _semantic_search(
+    db: Any,
+    context_text: str,
+    keyword_query: str | None = None,
+    scope_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Embed context text and run hybrid or vector-only search.
+
+    If a keyword_query is also provided, uses hybrid RRF to fuse
+    text + vector results. Otherwise uses vector-only search.
+    """
+    from .config import UCConfig
+    from .db.queries import hybrid_search, semantic_search
+
+    config = UCConfig.load()
+
+    from .embed import create_embed_provider
+
+    provider = await create_embed_provider(config)
+    if provider is None:
+        return [{"error": "no_embed_provider", "message": "Embeddings disabled in config"}]
+
+    try:
+        query_embedding = await provider.embed_query(context_text)
+
+        if keyword_query:
+            results = await hybrid_search(
+                db, keyword_query, query_embedding,
+                kind="summary", limit=10, scope_id=scope_id,
+            )
+        else:
+            results = await semantic_search(
+                db, query_embedding,
+                kind="summary", limit=10, scope_id=scope_id,
+            )
+
+        return [_sanitize_record(r) for r in results]
+    except Exception as e:
+        return [{"error": "embed_failed", "message": str(e)}]
+
+
+@app.command()
+def ask(
+    question: str = typer.Argument(..., help="Question about the project"),
+    project: Path | None = typer.Option(
+        None, "--project", "-p", help="Project path (default: cwd)"
+    ),
+    limit: int = typer.Option(10, "--limit", "-n", help="Max search results for context"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Ask a question about a project — answered by LLM using session context."""
+
+    async def _ask():
+        from .config import UCConfig
+        from .db.queries import get_working_memory, search_artifacts
+        from .db.schema import apply_schema
+        from .llm import ASK_SYSTEM_PROMPT, create_llm_fn
+
+        project_path = str((project or Path(".")).resolve())
+        config = UCConfig.load()
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+            scope = await _resolve_scope(db, project_path)
+            scope_id = str(scope["id"]) if scope else None
+
+            # Gather context: working memory + search results
+            context_parts: list[str] = []
+
+            if scope_id:
+                memory = await get_working_memory(db, scope_id)
+                if memory and memory.get("content"):
+                    context_parts.append(
+                        f"## Working Memory\n{memory['content']}"
+                    )
+
+            # Keyword search for relevant artifacts
+            search_results = await search_artifacts(
+                db, question, kind="summary", limit=limit, scope_id=scope_id,
+            )
+            if search_results:
+                summaries_text = "\n".join(
+                    f"- {r.get('content', '')[:500]}" for r in search_results
+                )
+                context_parts.append(
+                    f"## Relevant Session Summaries\n{summaries_text}"
+                )
+
+            # Also try semantic search if embed provider available
+            semantic_results = await _semantic_search(
+                db, question, scope_id=scope_id,
+            )
+            # Filter out error dicts
+            valid_semantic = [
+                r for r in semantic_results if "error" not in r
+            ]
+            if valid_semantic:
+                sem_text = "\n".join(
+                    f"- {r.get('content', '')[:500]}" for r in valid_semantic
+                )
+                context_parts.append(
+                    f"## Semantic Matches\n{sem_text}"
+                )
+
+            if not context_parts:
+                payload = {
+                    "error": "no_context",
+                    "message": "No project context found. Run the daemon first.",
+                }
+                if json_output:
+                    print(json_mod.dumps(payload))
+                else:
+                    console.print("[yellow]No project context found.[/yellow]")
+                    console.print("[dim]Run the daemon to capture sessions first.[/dim]")
+                return
+
+            # Build the LLM prompt
+            context_block = "\n\n".join(context_parts)
+            prompt = (
+                f"## Project Context\n{context_block}\n\n"
+                f"## Question\n{question}"
+            )
+
+            # Try LLM
+            llm_fn = await create_llm_fn(
+                config, system_prompt=ASK_SYSTEM_PROMPT, max_tokens=1000,
+            )
+
+            if llm_fn is None:
+                # Fallback: show raw context
+                if json_output:
+                    print(json_mod.dumps({
+                        "answer": None,
+                        "context": context_block,
+                        "message": "No LLM configured. Showing raw context.",
+                    }, default=str))
+                else:
+                    console.print("[yellow]No LLM configured — showing raw context:[/yellow]\n")
+                    from rich.markdown import Markdown
+                    console.print(Markdown(context_block))
+                return
+
+            if not json_output:
+                console.print("[dim]Thinking...[/dim]")
+
+            answer = await llm_fn(prompt)
+
+            if json_output:
+                print(json_mod.dumps({
+                    "answer": answer,
+                    "sources": len(search_results) + len(valid_semantic),
+                    "scope": scope_id,
+                }, default=str))
+            else:
+                from rich.markdown import Markdown
+                from rich.panel import Panel
+
+                console.print(Panel(
+                    Markdown(answer),
+                    title="Answer",
+                    border_style="green",
+                ))
+                console.print(
+                    f"[dim]Sources: {len(search_results)} keyword + "
+                    f"{len(valid_semantic)} semantic matches[/dim]"
+                )
+        finally:
+            await db.close()
+
+    _run_async(_ask())
+
+
+@app.command("rebuild-index")
+def rebuild_index(
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Rebuild the HNSW vector index (server mode only)."""
+
+    async def _rebuild():
+        from .db.schema import apply_schema, rebuild_hnsw_index
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+            rebuilt = await rebuild_hnsw_index(db)
+            if json_output:
+                print(json_mod.dumps({"rebuilt": rebuilt}))
+            elif rebuilt:
+                console.print("[green]HNSW index rebuilt successfully.[/green]")
+            else:
+                console.print("[dim]Skipped — HNSW index requires server mode.[/dim]")
+        finally:
+            await db.close()
+
+    _run_async(_rebuild())
+
+
+@app.command()
+def dashboard(
+    dev: bool = typer.Option(False, "--dev", help="Enable dev mode"),
+) -> None:
+    """Launch the TUI dashboard."""
+    from .tui.app import run_dashboard
+
+    run_dashboard()
+
+
+# --- Daemon sub-commands ---
+
+
+@daemon_app.command("start")
+def daemon_start(
+    foreground: bool = typer.Option(
+        False, "--foreground", "-f", help="Run in foreground"
+    ),
+) -> None:
+    """Start the UC daemon (watcher + worker)."""
+    from .daemon.core import run_daemon
+
+    uc_home = get_uc_home()
+    pid_file = uc_home / "daemon.pid"
+
+    if pid_file.exists():
+        pid = pid_file.read_text().strip()
+        console.print(f"[yellow]Daemon may already be running (PID: {pid})[/yellow]")
+        return
+
+    if foreground:
+        console.print("[bold]Starting UC daemon in foreground...[/bold]")
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text(str(os.getpid()))
+        try:
+            _run_async(run_daemon())
+        finally:
+            pid_file.unlink(missing_ok=True)
+    else:
+        console.print(
+            "[dim]Background mode not yet implemented. "
+            "Use --foreground or run in a tmux/screen session.[/dim]"
+        )
+
+
+@daemon_app.command("stop")
+def daemon_stop() -> None:
+    """Stop the UC daemon."""
+    uc_home = get_uc_home()
+    pid_file = uc_home / "daemon.pid"
+    if not pid_file.exists():
+        console.print("[yellow]Daemon is not running.[/yellow]")
+        return
+
+    pid = int(pid_file.read_text().strip())
+    try:
+        os.kill(pid, signal.SIGTERM)
+        console.print(f"[green]Sent SIGTERM to daemon (PID: {pid})[/green]")
+    except ProcessLookupError:
+        console.print(
+            f"[yellow]Daemon process {pid} not found — cleaning up PID file.[/yellow]"
+        )
+    pid_file.unlink(missing_ok=True)
+
+
+@daemon_app.command("status")
+def daemon_status() -> None:
+    """Show daemon status."""
+    uc_home = get_uc_home()
+    pid_file = uc_home / "daemon.pid"
+    if pid_file.exists():
+        pid = pid_file.read_text().strip()
+        console.print(f"[green]Daemon running[/green] (PID: {pid})")
+    else:
+        console.print("[dim]Daemon is not running.[/dim]")
+
+
+# --- Checkpoint sub-commands ---
+
+
+@checkpoint_app.command("create")
+def checkpoint_create(
+    label: str | None = typer.Option(None, "--label", "-l", help="Checkpoint label"),
+) -> None:
+    """Create a checkpoint at the current position."""
+    console.print("[yellow]Checkpoints require Phase 7 (sharing & checkpointing).[/yellow]")
+
+
+@checkpoint_app.command("list")
+def checkpoint_list() -> None:
+    """List all checkpoints."""
+    console.print("[yellow]Checkpoints require Phase 7.[/yellow]")
+
+
+@checkpoint_app.command("restore")
+def checkpoint_restore(
+    checkpoint_id: str = typer.Argument(..., help="Checkpoint ID to restore"),
+) -> None:
+    """Restore from a checkpoint."""
+    console.print("[yellow]Checkpoints require Phase 7.[/yellow]")
+
+
+# --- Share sub-commands ---
+
+
+@share_app.command("export")
+def share_export(
+    run_id: str = typer.Argument(..., help="Run ID to export"),
+    output: Path | None = typer.Option(None, "--output", "-o", help="Output path"),
+    encrypt: bool = typer.Option(False, "--encrypt", "-e", help="Encrypt the bundle"),
+) -> None:
+    """Export a run as a portable share bundle."""
+    console.print("[yellow]Share export requires Phase 7.[/yellow]")
+
+
+@share_app.command("import")
+def share_import(
+    bundle: Path = typer.Argument(..., help="Path to share bundle"),
+) -> None:
+    """Import a share bundle into the local database."""
+    console.print("[yellow]Share import requires Phase 7.[/yellow]")
+
+
+# --- Config sub-commands ---
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Show current configuration."""
+    from dataclasses import asdict
+
+    import yaml
+    from rich.syntax import Syntax
+
+    from .config import UCConfig
+
+    config = UCConfig.load()
+    content = yaml.dump(asdict(config), default_flow_style=False)
+    console.print(Syntax(content, "yaml", theme="monokai"))
+
+
+@config_app.command("set")
+def config_set(
+    key: str = typer.Argument(..., help="Config key"),
+    value: str = typer.Argument(..., help="Config value"),
+) -> None:
+    """Set a configuration value."""
+    from dataclasses import fields
+
+    from .config import UCConfig
+
+    config = UCConfig.load()
+    known = {f.name for f in fields(config)}
+    if key not in known:
+        console.print(f"[red]Unknown config key:[/red] {key}")
+        console.print(f"[dim]Available keys: {', '.join(sorted(known))}[/dim]")
+        raise typer.Exit(code=1)
+
+    field_type = type(getattr(config, key))
+    if field_type is bool:
+        parsed = value.lower() in ("true", "1", "yes")
+    elif field_type is int:
+        parsed = int(value)
+    elif field_type is float:
+        parsed = float(value)
+    else:
+        parsed = value
+
+    setattr(config, key, parsed)
+    config.save()
+    console.print(f"[green]Set[/green] {key} = {parsed}")
+
+
+# --- Scope sub-commands ---
+
+
+@scope_app.command("list")
+def scope_list(
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """List all scopes with stats (runs, turns, last activity)."""
+
+    async def _list():
+        from .db.queries import list_scopes_with_stats
+        from .db.schema import apply_schema
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+            scopes = await list_scopes_with_stats(db)
+
+            if json_output:
+                print(json_mod.dumps(
+                    [_sanitize_record(s) for s in scopes], default=str
+                ))
+                return
+
+            if not scopes:
+                console.print("[dim]No scopes found.[/dim]")
+                return
+
+            table = Table(title="Scopes")
+            table.add_column("ID", style="cyan")
+            table.add_column("Name", style="bold")
+            table.add_column("Path", max_width=40)
+            table.add_column("Runs", justify="right")
+            table.add_column("Turns", justify="right")
+            table.add_column("Agents")
+            table.add_column("Last Activity", style="dim")
+
+            for s in scopes:
+                agents = ", ".join(
+                    f"{k}({v})" for k, v in s.get("agent_breakdown", {}).items()
+                )
+                last = str(s.get("last_activity", ""))[:19] if s.get("last_activity") else ""
+                table.add_row(
+                    str(s["id"]),
+                    s["name"],
+                    (s.get("path") or "")[:40],
+                    str(s.get("run_count", 0)),
+                    str(s.get("turn_count", 0)),
+                    agents,
+                    last,
+                )
+            console.print(table)
+        finally:
+            await db.close()
+
+    _run_async(_list())
+
+
+@scope_app.command("show")
+def scope_show(
+    scope_ref: str = typer.Argument(..., help="Scope ID or name"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Show details for a scope."""
+
+    async def _show():
+        from .db.schema import apply_schema
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+            scope = await _resolve_scope_ref(db, scope_ref)
+            if not scope:
+                console.print(f"[red]Scope not found:[/red] {scope_ref}")
+                raise typer.Exit(code=1)
+
+            if json_output:
+                print(json_mod.dumps(_sanitize_record(scope), default=str))
+                return
+
+            console.print(f"[bold]{scope['id']}[/bold]")
+            console.print(f"  Name: {scope['name']}")
+            console.print(f"  Path: {scope.get('path', '(none)')}")
+            console.print(f"  Created: {scope.get('created_at', '')}")
+        finally:
+            await db.close()
+
+    _run_async(_show())
+
+
+@scope_app.command("update-path")
+def scope_update_path(
+    scope_ref: str = typer.Argument(..., help="Scope ID or name"),
+    new_path: Path = typer.Argument(..., help="New filesystem path"),
+) -> None:
+    """Update a scope's filesystem path (e.g. when a project folder moves)."""
+
+    async def _update():
+        from .db.queries import update_scope
+        from .db.schema import apply_schema
+
+        resolved = str(new_path.resolve())
+        if not new_path.exists():
+            console.print(f"[yellow]Warning: path does not exist on disk:[/yellow] {resolved}")
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+            scope = await _resolve_scope_ref(db, scope_ref)
+            if not scope:
+                console.print(f"[red]Scope not found:[/red] {scope_ref}")
+                raise typer.Exit(code=1)
+
+            sid = str(scope["id"])
+            await update_scope(db, sid, path=resolved)
+            console.print(f"[green]Updated[/green] {sid} path -> {resolved}")
+        finally:
+            await db.close()
+
+    _run_async(_update())
+
+
+@scope_app.command("rename")
+def scope_rename(
+    scope_ref: str = typer.Argument(..., help="Scope ID or name"),
+    new_name: str = typer.Argument(..., help="New display name"),
+) -> None:
+    """Change a scope's display name."""
+
+    async def _rename():
+        from .db.queries import update_scope
+        from .db.schema import apply_schema
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+            scope = await _resolve_scope_ref(db, scope_ref)
+            if not scope:
+                console.print(f"[red]Scope not found:[/red] {scope_ref}")
+                raise typer.Exit(code=1)
+
+            sid = str(scope["id"])
+            await update_scope(db, sid, name=new_name)
+            console.print(f"[green]Renamed[/green] {sid} -> {new_name}")
+        finally:
+            await db.close()
+
+    _run_async(_rename())
+
+
+@scope_app.command("merge")
+def scope_merge(
+    source: str = typer.Argument(..., help="Source scope ID or name"),
+    into: str = typer.Option(..., "--into", help="Target scope ID or name"),
+) -> None:
+    """Move all runs from source scope into target, then delete source."""
+
+    async def _merge():
+        from .db.queries import merge_scopes
+        from .db.schema import apply_schema
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+            src = await _resolve_scope_ref(db, source)
+            tgt = await _resolve_scope_ref(db, into)
+            if not src:
+                console.print(f"[red]Source scope not found:[/red] {source}")
+                raise typer.Exit(code=1)
+            if not tgt:
+                console.print(f"[red]Target scope not found:[/red] {into}")
+                raise typer.Exit(code=1)
+
+            src_id = str(src["id"])
+            tgt_id = str(tgt["id"])
+            if src_id == tgt_id:
+                console.print("[red]Source and target are the same scope.[/red]")
+                raise typer.Exit(code=1)
+
+            await merge_scopes(db, src_id, tgt_id)
+            console.print(
+                f"[green]Merged[/green] {src_id} ({src['name']}) "
+                f"-> {tgt_id} ({tgt['name']})"
+            )
+        finally:
+            await db.close()
+
+    _run_async(_merge())
+
+
+@scope_app.command("rm")
+def scope_rm(
+    scope_ref: str = typer.Argument(..., help="Scope ID or name"),
+    confirm: bool = typer.Option(False, "--confirm", help="Skip confirmation"),
+) -> None:
+    """Delete a scope and all its runs/turns/artifacts."""
+
+    async def _rm():
+        from .db.queries import delete_scope
+        from .db.schema import apply_schema
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+            scope = await _resolve_scope_ref(db, scope_ref)
+            if not scope:
+                console.print(f"[red]Scope not found:[/red] {scope_ref}")
+                raise typer.Exit(code=1)
+
+            sid = str(scope["id"])
+            if not confirm:
+                console.print(
+                    f"[yellow]This will delete scope {sid} ({scope['name']}) "
+                    f"and ALL its data.[/yellow]"
+                )
+                console.print("Use --confirm to proceed.")
+                raise typer.Exit(code=1)
+
+            await delete_scope(db, sid)
+            console.print(f"[green]Deleted[/green] {sid} ({scope['name']})")
+        finally:
+            await db.close()
+
+    _run_async(_rm())
+
+
+@scope_app.command("cleanup")
+def scope_cleanup(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be removed"),
+) -> None:
+    """Find and remove garbage scopes (date folders, hash dirs, empty scopes)."""
+
+    async def _cleanup():
+        import re
+
+        from .db.queries import delete_scope, list_scopes_with_stats
+        from .db.schema import apply_schema
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+            scopes = await list_scopes_with_stats(db)
+
+            garbage: list[dict[str, Any]] = []
+            for s in scopes:
+                path = s.get("path", "") or ""
+                name = s.get("name", "") or ""
+                is_garbage = False
+                reason = ""
+
+                # Date-like directories (e.g. "03", "09", "2025")
+                if re.match(r"^\d{1,4}$", name):
+                    is_garbage = True
+                    reason = "date-like directory name"
+
+                # SHA256 hash directories (64 hex chars)
+                elif re.match(r"^[0-9a-f]{40,64}$", name):
+                    is_garbage = True
+                    reason = "hash directory name"
+
+                # Paths inside .codex/sessions or .gemini/tmp
+                elif "/.codex/sessions/" in path or "/.gemini/tmp/" in path:
+                    is_garbage = True
+                    reason = "session metadata path"
+
+                # Empty scopes with no runs
+                elif s.get("run_count", 0) == 0:
+                    is_garbage = True
+                    reason = "empty scope (no runs)"
+
+                if is_garbage:
+                    garbage.append({**s, "reason": reason})
+
+            if not garbage:
+                console.print("[green]No garbage scopes found.[/green]")
+                return
+
+            table = Table(
+                title="Garbage Scopes" + (" (dry run)" if dry_run else "")
+            )
+            table.add_column("ID", style="cyan")
+            table.add_column("Name")
+            table.add_column("Path", max_width=40)
+            table.add_column("Runs", justify="right")
+            table.add_column("Reason", style="yellow")
+
+            for g in garbage:
+                table.add_row(
+                    str(g["id"]),
+                    g["name"],
+                    (g.get("path") or "")[:40],
+                    str(g.get("run_count", 0)),
+                    g["reason"],
+                )
+            console.print(table)
+
+            if dry_run:
+                console.print(
+                    f"\n[dim]{len(garbage)} scopes would be removed. "
+                    f"Run without --dry-run to delete.[/dim]"
+                )
+            else:
+                for g in garbage:
+                    await delete_scope(db, str(g["id"]))
+                console.print(
+                    f"\n[green]Removed {len(garbage)} garbage scopes.[/green]"
+                )
+        finally:
+            await db.close()
+
+    _run_async(_cleanup())
+
+
+# --- Memory sub-commands ---
+
+
+@memory_app.command("show")
+def memory_show(
+    project: Path | None = typer.Option(
+        None, "--project", "-p", help="Project path (default: cwd)",
+    ),
+    format_mode: str = typer.Option(
+        "plain", "--format", "-f", help="Output format: plain, inject",
+    ),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Show the working memory for a project."""
+
+    async def _show():
+        from .db.queries import get_working_memory
+        from .db.schema import apply_schema
+
+        project_path = str((project or Path(".")).resolve())
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+            scope = await _resolve_scope(db, project_path)
+            if not scope:
+                if format_mode == "inject":
+                    return  # Silent for hook injection
+                if json_output:
+                    print(json_mod.dumps({"error": "no_scope", "project": project_path}))
+                else:
+                    console.print(f"[yellow]No scope found for:[/yellow] {project_path}")
+                return
+
+            scope_id = str(scope["id"])
+            memory = await get_working_memory(db, scope_id)
+            if not memory:
+                if format_mode == "inject":
+                    return  # Silent for hook injection
+                if json_output:
+                    print(json_mod.dumps({
+                        "error": "no_memory",
+                        "scope": _sanitize_record(scope),
+                    }))
+                else:
+                    console.print("[dim]No working memory for this project yet.[/dim]")
+                    console.print("[dim]Run: uc memory refresh --project .[/dim]")
+                return
+
+            content = memory.get("content", "")
+
+            if json_output:
+                print(json_mod.dumps({
+                    **_sanitize_record(memory),
+                    "scope": _sanitize_record(scope),
+                }, default=str))
+            elif format_mode == "inject":
+                # Raw markdown for hook injection — no Rich formatting
+                print(content)
+            else:
+                from rich.markdown import Markdown
+                from rich.panel import Panel
+
+                console.print(Panel(
+                    Markdown(content),
+                    title=f"Working Memory: {scope.get('name', '')}",
+                    border_style="blue",
+                ))
+                created = str(memory.get("created_at", ""))[:19]
+                method = memory.get("metadata", {}).get("method", "")
+                console.print(
+                    f"[dim]Updated: {created}  Method: {method}  "
+                    f"ID: {memory.get('id')}[/dim]"
+                )
+        finally:
+            await db.close()
+
+    _run_async(_show())
+
+
+@memory_app.command("refresh")
+def memory_refresh(
+    project: Path | None = typer.Option(
+        None, "--project", "-p", help="Project path (default: cwd)",
+    ),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Force-regenerate the working memory now (runs inline, no daemon needed)."""
+
+    async def _refresh():
+        from .config import UCConfig
+        from .db.queries import backfill_artifact_scopes, get_working_memory
+        from .db.schema import apply_schema, rebuild_hnsw_index
+        from .embed import create_embed_provider
+        from .llm import create_llm_fn
+
+        project_path = str((project or Path(".")).resolve())
+        config = UCConfig.load()
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+
+            # Backfill scope on any existing artifacts that lack it
+            backfilled = await backfill_artifact_scopes(db)
+            if backfilled and not json_output:
+                console.print(f"[dim]Backfilled scope on {backfilled} artifacts.[/dim]")
+
+            scope = await _resolve_scope(db, project_path)
+            if not scope:
+                if json_output:
+                    print(json_mod.dumps({"error": "no_scope", "project": project_path}))
+                else:
+                    console.print(f"[yellow]No scope found for:[/yellow] {project_path}")
+                return
+
+            scope_id = str(scope["id"])
+            llm_fn = await create_llm_fn(config)
+            if llm_fn is None:
+                if json_output:
+                    print(json_mod.dumps({"error": "no_llm", "message": "LLM not configured"}))
+                else:
+                    console.print("[red]LLM not configured. Working memory requires an LLM.[/red]")
+                return
+
+            embed_provider = await create_embed_provider(config)
+
+            from .daemon.processors.memory import WorkingMemoryProcessor
+
+            processor = WorkingMemoryProcessor(
+                llm_fn=llm_fn,
+                embed_fn=embed_provider,
+                max_summaries=config.memory_max_summaries,
+            )
+
+            if not json_output:
+                console.print(f"[bold]Refreshing working memory for {scope.get('name')}...[/bold]")
+
+            job = {"target": scope_id}
+            result = await processor.process(db, job)
+
+            # Rebuild HNSW index so new embeddings are searchable
+            rebuilt = await rebuild_hnsw_index(db)
+
+            if json_output:
+                # Include the actual memory content
+                memory = await get_working_memory(db, scope_id)
+                print(json_mod.dumps({
+                    "result": result,
+                    "memory": _sanitize_record(memory) if memory else None,
+                    "hnsw_rebuilt": rebuilt,
+                    "backfilled": backfilled,
+                }, default=str))
+            else:
+                if result.get("status") == "skipped":
+                    console.print(f"[yellow]Skipped:[/yellow] {result.get('reason')}")
+                else:
+                    console.print(
+                        f"[green]Working memory updated[/green] "
+                        f"({result.get('summaries_used', 0)} summaries distilled)"
+                    )
+                    if rebuilt:
+                        console.print("[dim]HNSW index rebuilt.[/dim]")
+        finally:
+            await db.close()
+
+    _run_async(_refresh())
+
+
+@memory_app.command("history")
+def memory_history(
+    project: Path | None = typer.Option(
+        None, "--project", "-p", help="Project path (default: cwd)",
+    ),
+    limit: int = typer.Option(5, "--limit", "-n", help="Max versions to show"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Show previous versions of the working memory."""
+
+    async def _history():
+        from .db.queries import get_working_memory_history
+        from .db.schema import apply_schema
+
+        project_path = str((project or Path(".")).resolve())
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+            scope = await _resolve_scope(db, project_path)
+            if not scope:
+                if json_output:
+                    print(json_mod.dumps({"error": "no_scope", "project": project_path}))
+                else:
+                    console.print(f"[yellow]No scope found for:[/yellow] {project_path}")
+                return
+
+            scope_id = str(scope["id"])
+            versions = await get_working_memory_history(db, scope_id, limit=limit)
+
+            if json_output:
+                print(json_mod.dumps(
+                    [_sanitize_record(v) for v in versions], default=str,
+                ))
+                return
+
+            if not versions:
+                console.print("[dim]No working memory versions found.[/dim]")
+                return
+
+            table = Table(title=f"Working Memory History: {scope.get('name', '')}")
+            table.add_column("#", style="cyan", justify="right")
+            table.add_column("ID", style="dim")
+            table.add_column("Method")
+            table.add_column("Created", style="dim")
+            table.add_column("Preview", max_width=50)
+
+            for i, v in enumerate(versions, 1):
+                method = v.get("metadata", {}).get("method", "")
+                created = str(v.get("created_at", ""))[:19]
+                preview = (v.get("content", "") or "")[:50].replace("\n", " ")
+                table.add_row(
+                    str(i),
+                    str(v.get("id", "")),
+                    method,
+                    created,
+                    preview,
+                )
+            console.print(table)
+        finally:
+            await db.close()
+
+    _run_async(_history())
+
+
+@memory_app.command("install-hook")
+def memory_install_hook() -> None:
+    """Install the SessionStart hook into Claude Code settings.
+
+    Adds a hook that runs `uc memory show --project . --format inject`
+    at the start of each Claude Code session, injecting project working
+    memory into the agent's context automatically.
+    """
+    settings_path = Path.home() / ".claude" / "settings.json"
+
+    hook_command = "uc memory show --project . --format inject 2>/dev/null || true"
+
+    if settings_path.exists():
+        settings = json_mod.loads(settings_path.read_text(encoding="utf-8"))
+    else:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings = {}
+
+    hooks = settings.setdefault("hooks", {})
+    session_start = hooks.setdefault("SessionStart", [])
+
+    # Check if already installed
+    for entry in session_start:
+        for h in entry.get("hooks", []):
+            if h.get("command", "") == hook_command:
+                console.print("[dim]Hook already installed.[/dim]")
+                return
+
+    session_start.append({
+        "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": hook_command,
+        }],
+    })
+
+    settings_path.write_text(
+        json_mod.dumps(settings, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    console.print(f"[green]Installed SessionStart hook[/green] in {settings_path}")
+    console.print(f"[dim]Command: {hook_command}[/dim]")
+
+
+# Sentinel markers for AGENTS.md injection
+_MEMORY_START = "<!-- UC:MEMORY:START -->"
+_MEMORY_END = "<!-- UC:MEMORY:END -->"
+
+
+@memory_app.command("inject")
+def memory_inject(
+    project: Path | None = typer.Option(
+        None, "--project", "-p", help="Project path (default: cwd)",
+    ),
+    target: str = typer.Option(
+        "AGENTS.md", "--target", "-t",
+        help="Target file to inject into (AGENTS.md, CLAUDE.md, etc.)",
+    ),
+) -> None:
+    """Write working memory into a project file (AGENTS.md by default).
+
+    Uses sentinel markers so repeated runs update only the memory section.
+    Works across all AI IDEs: Claude Code reads CLAUDE.md, Codex reads AGENTS.md.
+    """
+
+    async def _inject():
+        from .db.queries import get_working_memory
+        from .db.schema import apply_schema
+
+        project_path = (project or Path(".")).resolve()
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+            scope = await _resolve_scope(db, str(project_path))
+            if not scope:
+                console.print(f"[yellow]No scope found for:[/yellow] {project_path}")
+                return
+
+            scope_id = str(scope["id"])
+            memory = await get_working_memory(db, scope_id)
+            if not memory:
+                console.print(
+                    "[dim]No working memory yet. "
+                    "Run: uc memory refresh --project .[/dim]"
+                )
+                return
+
+            content = memory.get("content", "")
+            memory_block = f"{_MEMORY_START}\n{content}\n{_MEMORY_END}"
+
+            target_path = project_path / target
+            if target_path.exists():
+                existing = target_path.read_text(encoding="utf-8")
+                # Replace existing memory section or append
+                if _MEMORY_START in existing:
+                    import re
+                    pattern = re.escape(_MEMORY_START) + r".*?" + re.escape(_MEMORY_END)
+                    new_content = re.sub(pattern, memory_block, existing, flags=re.DOTALL)
+                else:
+                    new_content = existing.rstrip() + "\n\n" + memory_block + "\n"
+            else:
+                new_content = memory_block + "\n"
+
+            target_path.write_text(new_content, encoding="utf-8")
+            console.print(
+                f"[green]Injected working memory into[/green] {target_path.name}"
+            )
+        finally:
+            await db.close()
+
+    _run_async(_inject())
+
+
+@memory_app.command("eject")
+def memory_eject(
+    project: Path | None = typer.Option(
+        None, "--project", "-p", help="Project path (default: cwd)",
+    ),
+    target: str = typer.Option(
+        "AGENTS.md", "--target", "-t",
+        help="Target file to eject from",
+    ),
+) -> None:
+    """Remove the working memory section from a project file."""
+    import re
+
+    project_path = (project or Path(".")).resolve()
+    target_path = project_path / target
+
+    if not target_path.exists():
+        console.print(f"[dim]{target_path.name} does not exist.[/dim]")
+        return
+
+    existing = target_path.read_text(encoding="utf-8")
+    if _MEMORY_START not in existing:
+        console.print(f"[dim]No memory section found in {target_path.name}.[/dim]")
+        return
+
+    pattern = r"\n*" + re.escape(_MEMORY_START) + r".*?" + re.escape(_MEMORY_END) + r"\n*"
+    cleaned = re.sub(pattern, "\n", existing, flags=re.DOTALL).strip()
+
+    if cleaned:
+        target_path.write_text(cleaned + "\n", encoding="utf-8")
+    else:
+        target_path.unlink()
+
+    console.print(f"[green]Ejected working memory from[/green] {target_path.name}")
+
+
+# --- Helpers ---
+
+
+async def _resolve_scope(db: Any, project_path: str) -> dict[str, Any] | None:
+    """Resolve a project path to a scope using multiple strategies.
+
+    1. Exact path match
+    2. Name match (if input looks like a name)
+    3. Parent directory walk
+    """
+    from .db.queries import find_scope_by_name, find_scope_by_path
+
+    # 1. Exact path match
+    scope = await find_scope_by_path(db, project_path)
+    if scope:
+        return scope
+
+    # 2. Name match — try the basename
+    basename = Path(project_path).name
+    candidates = await find_scope_by_name(db, basename)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        # Pick the scope whose path is the longest prefix of project_path
+        best = None
+        best_len = -1
+        for c in candidates:
+            cp = c.get("path", "")
+            if cp and project_path.startswith(cp) and len(cp) > best_len:
+                best = c
+                best_len = len(cp)
+        if best:
+            return best
+        # Otherwise return the most recently created one
+        return candidates[0]
+
+    # 3. Parent directory walk
+    for parent in Path(project_path).parents:
+        parent_str = str(parent)
+        scope = await find_scope_by_path(db, parent_str)
+        if scope:
+            return scope
+
+    return None
+
+
+async def _resolve_scope_ref(db: Any, ref: str) -> dict[str, Any] | None:
+    """Resolve a scope reference (ID, name, or path) to a scope record."""
+    from .db.queries import find_scope_by_name, find_scope_by_path, get_scope
+
+    # Try as a scope ID first (e.g. "scope:abc123")
+    if ref.startswith("scope:"):
+        return await get_scope(db, ref)
+
+    # Try as an exact path
+    scope = await find_scope_by_path(db, ref)
+    if scope:
+        return scope
+
+    # Try as a name
+    candidates = await find_scope_by_name(db, ref)
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        # Exact name match preferred
+        for c in candidates:
+            if c.get("name", "").lower() == ref.lower():
+                return c
+        return candidates[0]
+
+    return None
+
+
+def _check(label: str, ok: bool) -> None:
+    icon = "[green]OK[/green]" if ok else "[red]FAIL[/red]"
+    console.print(f"  {icon}  {label}")

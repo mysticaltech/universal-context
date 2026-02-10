@@ -1,0 +1,128 @@
+---
+name: pulling-context
+description: >-
+  Use this skill when you need to recall past work, understand prior decisions,
+  resume a previous session, debug something seen before, or when the user asks
+  "what did we do", "what was decided", "how does X work" about this project.
+  Also use after completing significant work to persist knowledge.
+---
+
+# Universal Context — Project Memory
+
+You have access to **Universal Context** (`uc`), an operational memory engine that captures AI coding sessions across Claude Code, Codex, and Gemini CLI. It stores every turn with full provenance and provides semantic search, keyword search, and LLM-powered Q&A.
+
+## Fast path: ask a question
+
+For most cases, a single command gets you the answer:
+
+```bash
+uc ask "How does the auth middleware work?" --project .
+uc ask "What bugs were fixed recently?" --project .
+uc ask "What's the database schema design?" --project . --json
+```
+
+This gathers working memory + scope-filtered search results, sends them to an LLM, and returns a synthesized answer with citations. Use `--json` when you need structured output.
+
+Falls back to displaying raw search results if no LLM is configured.
+
+## Working memory
+
+Working memory is an LLM-distilled summary of the project's recent sessions. It may already be in your system context as a `# Project Memory:` block — use it as your baseline.
+
+```bash
+uc memory show --project .       # view current working memory
+uc memory refresh --project .    # regenerate from latest sessions
+```
+
+If the memory looks stale (mentions things as "in progress" that are clearly done), refresh it.
+
+## Deep exploration
+
+When you need to dig deeper than a single question:
+
+### Semantic search — find relevant past work by meaning
+
+```bash
+uc context --json --context "describe what you're working on"
+```
+
+The `--context` flag uses embedding-based retrieval. Be specific — the more detail, the better the results:
+- `--context "debugging JWT token expiration in the auth middleware"`
+- `--context "adding pagination to the /api/users endpoint"`
+
+Returns `semantic_results` (ranked by cosine similarity) and `runs` (recent sessions with turn summaries).
+
+### Keyword search — find exact terms
+
+```bash
+uc context --json --query "authentication"
+uc context --json --context "auth flow" --query "JWT"  # combine both
+```
+
+### Scoped artifact search
+
+```bash
+uc search "database migration" --project .             # keyword search, scoped to project
+uc search "schema" --project . --kind summary --json   # filter by artifact kind
+```
+
+### Inspect a specific turn
+
+```bash
+uc inspect --json "turn:abc123"
+```
+
+Returns the turn's artifacts (transcripts, summaries) and full provenance chain.
+
+## After significant work
+
+Persist what was accomplished so future sessions benefit:
+
+```bash
+uc memory refresh --project .
+```
+
+This regenerates the working memory from recent sessions, backfills scope metadata, and rebuilds the vector index. Do this after completing a feature, fixing a major bug, or making architectural decisions.
+
+To make the memory available to other AI tools (Codex, Gemini):
+
+```bash
+uc memory inject --project .     # writes to AGENTS.md
+```
+
+## Error handling
+
+| Error | Action |
+|-------|--------|
+| `"error": "no_scope"` | No sessions tracked for this project yet |
+| `"error": "no_embed_provider"` | Embeddings unconfigured — use `--query` keyword search instead |
+| `"error": "embed_failed"` | Embedding API error — fall back to `--query` |
+| `"error": "db_unavailable"` | Run `uc doctor` to diagnose |
+| `command not found: uc` | UC CLI not installed |
+| Empty results | No sessions captured — daemon may need `uc daemon start -f` |
+
+## CLI reference
+
+```
+# Questions
+uc ask "question" --project .                    # LLM-powered Q&A (best for specific questions)
+uc ask "question" --project . --json             # JSON output
+
+# Working memory
+uc memory show --project .                       # View distilled project context
+uc memory refresh --project .                    # Regenerate + backfill + rebuild index
+uc memory inject --project .                     # Write to AGENTS.md (cross-IDE)
+uc memory install-hook                           # Auto-inject on session start
+
+# Search & context
+uc context --json --context "task description"   # Semantic retrieval
+uc context --json --query "keyword"              # Keyword search (BM25)
+uc context --json --context "..." --query "..."  # Hybrid (both combined)
+uc search "query" --project .                    # Scoped artifact search
+uc search "query" --project . --kind summary     # Filter by kind
+
+# Inspect
+uc inspect --json "turn:id"                      # Turn details + provenance
+uc timeline --json                               # Latest run timeline
+uc status --json                                 # System overview
+```

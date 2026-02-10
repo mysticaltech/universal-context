@@ -1,0 +1,221 @@
+"""Tests for the daemon — watcher, worker, and processors."""
+
+import asyncio
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+
+from universal_context.daemon.processors.base import BaseProcessor
+from universal_context.daemon.processors.summarizer import TurnSummarizer
+from universal_context.daemon.watcher import Watcher
+from universal_context.daemon.worker import Worker
+from universal_context.db.client import UCDatabase
+from universal_context.db.queries import (
+    claim_next_job,
+    create_job,
+    create_run,
+    create_scope,
+    create_turn_with_artifact,
+    get_run,
+    list_jobs,
+)
+from universal_context.db.schema import apply_schema
+
+
+@pytest.fixture
+async def db():
+    """In-memory database with schema."""
+    database = UCDatabase.in_memory()
+    await database.connect()
+    await apply_schema(database)
+    yield database
+    await database.close()
+
+
+# ============================================================
+# WATCHER TESTS
+# ============================================================
+
+
+class TestWatcher:
+    async def test_recover_interrupted_runs(self, db: UCDatabase):
+        """Watcher should mark active runs as crashed on startup."""
+        scope = await create_scope(db, "proj", "/tmp/proj")
+        scope_id = str(scope["id"])
+        run = await create_run(db, scope_id, "claude")
+        run_id = str(run["id"])
+
+        watcher = Watcher(db=db, poll_interval=1.0)
+        await watcher.recover_interrupted_runs()
+
+        updated = await get_run(db, run_id)
+        assert updated["status"] == "crashed"
+
+    async def test_ensure_scope_reuse(self, db: UCDatabase):
+        """Watcher should reuse existing scope for same path."""
+        watcher = Watcher(db=db, poll_interval=1.0)
+        id1 = await watcher._ensure_scope(Path("/tmp/proj"))
+        id2 = await watcher._ensure_scope(Path("/tmp/proj"))
+        assert id1 == id2
+
+    async def test_ensure_scope_creates_new(self, db: UCDatabase):
+        """Watcher should create new scope for new path."""
+        watcher = Watcher(db=db, poll_interval=1.0)
+        id1 = await watcher._ensure_scope(Path("/tmp/proj1"))
+        id2 = await watcher._ensure_scope(Path("/tmp/proj2"))
+        assert id1 != id2
+
+
+# ============================================================
+# WORKER TESTS
+# ============================================================
+
+
+class TestWorker:
+    async def test_claim_and_process(self, db: UCDatabase):
+        """Worker should claim a job and process it."""
+
+        class DummyProcessor(BaseProcessor):
+            async def process(self, db, job):
+                return {"status": "processed"}
+
+        worker = Worker(db=db, poll_interval=0.1)
+        worker.register_processor("test_job", DummyProcessor())
+
+        # Create a job
+        await create_job(db, "test_job", "target:1")
+
+        # Process one job
+        processed = await worker._claim_and_process()
+        assert processed is True
+
+        # Job should be completed
+        jobs = await list_jobs(db, status="completed")
+        assert len(jobs) == 1
+        assert jobs[0]["result"]["status"] == "processed"
+
+    async def test_no_jobs_returns_false(self, db: UCDatabase):
+        worker = Worker(db=db, poll_interval=0.1)
+        processed = await worker._claim_and_process()
+        assert processed is False
+
+    async def test_unknown_job_type_fails(self, db: UCDatabase):
+        """Jobs with no registered processor should fail."""
+        worker = Worker(db=db, poll_interval=0.1)
+        await create_job(db, "unknown_type", "target:1")
+        await worker._claim_and_process()
+
+        jobs = await list_jobs(db, status="pending")
+        # Should be back to pending (retry)
+        assert len(jobs) == 1
+        assert "No processor" in (jobs[0].get("error") or "")
+
+    async def test_processor_exception_fails_job(self, db: UCDatabase):
+        """If a processor raises, the job should be marked failed."""
+
+        class FailProcessor(BaseProcessor):
+            async def process(self, db, job):
+                raise RuntimeError("LLM timeout")
+
+        worker = Worker(db=db, poll_interval=0.1)
+        worker.register_processor("fail_job", FailProcessor())
+        await create_job(db, "fail_job", "target:1")
+        await worker._claim_and_process()
+
+        jobs = await list_jobs(db, status="pending")
+        assert len(jobs) == 1
+        assert "LLM timeout" in (jobs[0].get("error") or "")
+
+    async def test_worker_loop_stops(self, db: UCDatabase):
+        """Worker should stop when stop() is called."""
+        worker = Worker(db=db, poll_interval=0.05)
+
+        async def stop_after_delay():
+            await asyncio.sleep(0.15)
+            worker.stop()
+
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(worker.run())
+            tg.create_task(stop_after_delay())
+
+        assert not worker._running
+
+
+# ============================================================
+# SUMMARIZER PROCESSOR TESTS
+# ============================================================
+
+
+class TestTurnSummarizer:
+    async def _setup_turn(self, db: UCDatabase) -> tuple[str, str]:
+        """Create a scope→run→turn+artifact chain. Returns (turn_id, artifact_id)."""
+        scope = await create_scope(db, "proj")
+        scope_id = str(scope["id"])
+        run = await create_run(db, scope_id, "claude")
+        run_id = str(run["id"])
+        result = await create_turn_with_artifact(
+            db,
+            run_id,
+            sequence=1,
+            user_message="explain binary search",
+            raw_content=(
+                "user: explain binary search\n"
+                "assistant: Binary search is an efficient algorithm that finds "
+                "the position of a target value within a sorted array. It works "
+                "by repeatedly dividing the search interval in half."
+            ),
+            create_summary_job=True,
+        )
+        return result["turn_id"], result["artifact_id"]
+
+    async def test_extractive_summary(self, db: UCDatabase):
+        """Without LLM, summarizer should produce extractive summary."""
+        turn_id, artifact_id = await self._setup_turn(db)
+
+        # Claim the auto-created job
+        job = await claim_next_job(db)
+        assert job is not None
+
+        summarizer = TurnSummarizer(max_chars=100)
+        result = await summarizer.process(db, job)
+
+        assert result["method"] == "extractive"
+        assert result["summary_id"].startswith("artifact:")
+        assert result["length"] > 0
+
+    async def test_llm_summary(self, db: UCDatabase):
+        """With LLM function, summarizer should use it."""
+        turn_id, artifact_id = await self._setup_turn(db)
+        job = await claim_next_job(db)
+
+        llm_fn = AsyncMock(return_value="Binary search divides and conquers.")
+        summarizer = TurnSummarizer(llm_fn=llm_fn)
+        result = await summarizer.process(db, job)
+
+        assert result["method"] == "llm"
+        llm_fn.assert_awaited_once()
+
+    async def test_llm_fallback(self, db: UCDatabase):
+        """If LLM fails, should fall back to extractive."""
+        turn_id, artifact_id = await self._setup_turn(db)
+        job = await claim_next_job(db)
+
+        llm_fn = AsyncMock(side_effect=RuntimeError("API error"))
+        summarizer = TurnSummarizer(llm_fn=llm_fn, max_chars=50)
+        result = await summarizer.process(db, job)
+
+        assert result["method"] == "extractive_fallback"
+
+    async def test_extractive_truncation(self):
+        """Extractive summary should truncate at word boundaries."""
+        summarizer = TurnSummarizer(max_chars=20)
+        result = summarizer._extractive_summary("Hello world this is a test")
+        assert result.endswith("...")
+        assert len(result) <= 25  # 20 + "..."
+
+    async def test_short_content_no_truncation(self):
+        """Short content should not be truncated."""
+        summarizer = TurnSummarizer(max_chars=100)
+        result = summarizer._extractive_summary("Short text")
+        assert result == "Short text"

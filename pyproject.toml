@@ -1,0 +1,71 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "universal-context"
+version = "0.1.0"
+description = "Operational memory engine for AI agents — sovereign, local-first, provenance-preserving"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13"
+authors = [{ name = "Karim" }]
+keywords = ["ai", "agents", "memory", "context", "surrealdb"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "surrealdb @ git+https://github.com/surrealdb/surrealdb.py.git@1ff4470e",
+    "typer>=0.21",
+    "textual>=7.5",
+    "pydantic>=2.12",
+    "rich>=14.3",
+    "pyyaml>=6.0",
+    "httpx>=0.28",
+    "watchfiles>=1.1",
+    "cryptography>=46.0",
+    "openai>=1.68",
+    # Local embeddings (EmbeddingGemma-300M via ONNX — no API keys needed)
+    "onnxruntime>=1.20",
+    "transformers>=4.51",
+    "huggingface-hub>=0.30",
+    "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+llm = [
+    "anthropic>=0.49",
+]
+dev = [
+    "pytest>=9.0",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.15",
+    "mypy>=1.15",
+]
+
+[project.scripts]
+uc = "universal_context.cli:app"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: tests using real LLM APIs and embedding models (may be slow, costs money)",
+]
