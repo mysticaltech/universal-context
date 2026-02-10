@@ -163,6 +163,8 @@ That's it. UC is now watching your AI coding sessions and building your operatio
 
 ## SurrealDB Setup
 
+> **Important: UC requires SurrealDB v3 (beta).** The default installer gets v2 — you must pass `--version` to get v3. UC will not work with SurrealDB v2.
+
 UC works in two modes:
 
 | Mode | Search Capabilities | Setup |
@@ -170,36 +172,29 @@ UC works in two modes:
 | **Embedded** (`file://`) | Substring match + brute-force cosine | Zero config — works out of the box |
 | **Server** (`ws://`) | BM25 full-text + HNSW vector KNN | 2 minutes — full-power search |
 
-The embedded mode works immediately. When you're ready for full-power search, you have two options:
-
-### Option A: Local Server
+The embedded mode works immediately with no extra setup. When you're ready for full-power search:
 
 ```bash
-# Install SurrealDB v3
-curl -sSf https://install.surrealdb.com | sh
+# Install SurrealDB v3 (must specify version — default installs v2)
+curl -sSf https://install.surrealdb.com | sh -s -- --version v3.0.0-beta.3
+
+# Verify you have v3
+surreal version
+# Expected: 3.0.0-beta.3
 
 # Start the server
 surreal start --bind 127.0.0.1:8000 --user root --pass root surrealkv://~/.surrealdb/data
 ```
 
-### Option B: SurrealDB Cloud (Free Tier)
-
-Don't want to run a local server? [SurrealDB Cloud](https://surrealdb.com/cloud) offers a free tier (1 GB storage, no credit card) — ideal for getting started:
-
-1. Sign up at [surrealdb.com](https://surrealdb.com/cloud)
-2. Create a database instance
-3. Use the provided `wss://` endpoint in your UC config
-
-### Point UC at Your Server
+Then point UC at it in `~/.uc/config.yaml`:
 
 ```yaml
-# ~/.uc/config.yaml
-db_url: "ws://127.0.0.1:8000"   # or wss://your-instance.surrealdb.cloud
+db_url: "ws://127.0.0.1:8000"
 db_user: "root"
 db_pass: "root"
 ```
 
-**What you get:** BM25 full-text search with relevance ranking, HNSW approximate nearest neighbor search for semantic queries, and automatic index rebuilds.
+**What you get:** BM25 full-text search with relevance ranking, HNSW approximate nearest neighbor search for semantic queries, and automatic index rebuilds. Without it, search still works via substring matching and brute-force cosine similarity — just slower at scale.
 
 ---
 
