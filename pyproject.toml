@@ -7,7 +7,7 @@ name = "universal-context"
 version = "0.1.0"
 description = "Operational memory engine for AI agents — sovereign, local-first, provenance-preserving"
 readme = "README.md"
-license = "MIT"
+license = "Apache-2.0"
 requires-python = ">=3.13"
 authors = [{ name = "Karim" }]
 keywords = ["ai", "agents", "memory", "context", "surrealdb"]

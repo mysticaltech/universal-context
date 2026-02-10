@@ -27,3 +27,6 @@ venv/
 history.txt
 tasks/
 nanobanana-output/
+
+# Lock files
+uv.lock
