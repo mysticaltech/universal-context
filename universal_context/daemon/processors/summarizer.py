@@ -132,16 +132,30 @@ class TurnSummarizer(BaseProcessor):
         return truncated + "..."
 
     @staticmethod
-    def _find_transcript_id(artifacts: list[dict[str, Any]]) -> str | None:
+    def _find_transcript_id(artifacts: list[Any]) -> str | None:
         """Extract the transcript artifact ID from graph traversal results.
 
         get_turn_artifacts returns results like:
         [{'->produced': {'->artifact': [RecordID(...)]}}]
+
+        But SurrealDB may sometimes return flattened formats (strings or
+        RecordID objects directly), so we handle both.
         """
         for item in artifacts:
-            produced = item.get("->produced", {})
-            if isinstance(produced, dict):
-                artifact_ids = produced.get("->artifact", [])
-                if artifact_ids:
-                    return str(artifact_ids[0])
+            # Standard nested dict format
+            if isinstance(item, dict):
+                produced = item.get("->produced", {})
+                if isinstance(produced, dict):
+                    artifact_ids = produced.get("->artifact", [])
+                    if artifact_ids:
+                        return str(artifact_ids[0])
+                # Flattened key format
+                flat = item.get("->produced->artifact", [])
+                if flat:
+                    return str(flat[0]) if isinstance(flat, list) else str(flat)
+            # RecordID or string — the item IS the artifact ID
+            elif hasattr(item, "table_name") or (
+                isinstance(item, str) and item.startswith("artifact:")
+            ):
+                return str(item)
         return None

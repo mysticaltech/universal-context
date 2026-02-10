@@ -225,6 +225,9 @@ def search(
 @app.command()
 def timeline(
     run_id: str | None = typer.Argument(None, help="Run ID (omit for latest)"),
+    project: Path | None = typer.Option(
+        None, "--project", "-p", help="Project path to scope the query"
+    ),
     branch: str | None = typer.Option(
         None, "--branch", "-b", help="Filter runs by git branch (used when no run_id)"
     ),
@@ -241,8 +244,16 @@ def timeline(
         try:
             await apply_schema(db)
 
+            scope_id = None
+            if project is not None and run_id is None:
+                scope = await _resolve_scope(db, str(project.resolve()))
+                if scope:
+                    scope_id = str(scope["id"])
+
             if run_id is None:
-                runs = await list_runs(db, branch=branch, limit=1)
+                runs = await list_runs(
+                    db, scope_id=scope_id, branch=branch, limit=1,
+                )
                 if not runs:
                     if json_output:
                         print(json_mod.dumps(
@@ -251,17 +262,24 @@ def timeline(
                     else:
                         console.print("[dim]No runs found.[/dim]")
                     return
-                rid = str(runs[0]["id"])
+                run_record = runs[0]
+                rid = str(run_record["id"])
             else:
                 rid = run_id
+                from .db.queries import get_run
+                run_record = await get_run(db, rid)
 
             turns = await list_turns(db, rid)
 
             if json_output:
-                print(json_mod.dumps({
-                    "run_id": rid,
-                    "turns": [_sanitize_record(t) for t in turns],
-                }, default=str))
+                out: dict[str, Any] = {"run_id": rid}
+                if run_record:
+                    out["branch"] = run_record.get("branch")
+                    out["commit_sha"] = run_record.get("commit_sha")
+                    out["merged_to"] = run_record.get("merged_to")
+                    out["status"] = run_record.get("status")
+                out["turns"] = [_sanitize_record(t) for t in turns]
+                print(json_mod.dumps(out, default=str))
                 return
 
             if not turns:
