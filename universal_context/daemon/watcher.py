@@ -19,11 +19,14 @@ from ..db.queries import (
     create_scope,
     create_turn_with_artifact,
     end_run,
+    find_scope_by_canonical_id,
     find_scope_by_path,
     list_jobs,
     list_runs,
     list_scopes,
+    update_scope,
 )
+from ..git import get_current_branch, get_head_sha, resolve_canonical_id
 
 logger = logging.getLogger(__name__)
 
@@ -120,12 +123,21 @@ class Watcher:
                 Path.home(), name_override="unknown"
             )
 
+        # Capture git context for provenance
+        branch = None
+        commit_sha = None
+        if project_path:
+            branch = await asyncio.to_thread(get_current_branch, project_path)
+            commit_sha = await asyncio.to_thread(get_head_sha, project_path)
+
         # Create a run
         run = await create_run(
             self._db,
             scope_id,
             adapter.name,
             session_path=str(session_path),
+            branch=branch,
+            commit_sha=commit_sha,
         )
         run_id = str(run["id"])
 
@@ -203,14 +215,33 @@ class Watcher:
     async def _ensure_scope(
         self, path: Path, name_override: str | None = None,
     ) -> str:
-        """Get or create a scope for the given path."""
+        """Get or create a scope for the given path.
+
+        Uses git-aware canonical identity: same git remote = same scope,
+        even across worktrees or different checkout paths.
+        """
         path_str = str(path.resolve())
-        existing = await find_scope_by_path(self._db, path_str)
+        canonical_id = await asyncio.to_thread(resolve_canonical_id, path)
+
+        # 1. Primary: look up by canonical_id
+        existing = await find_scope_by_canonical_id(self._db, canonical_id)
         if existing:
             return str(existing["id"])
 
+        # 2. Backwards compat: look up by path (pre-migration scopes without canonical_id)
+        existing = await find_scope_by_path(self._db, path_str)
+        if existing:
+            if not existing.get("canonical_id"):
+                await update_scope(
+                    self._db, str(existing["id"]), canonical_id=canonical_id,
+                )
+            return str(existing["id"])
+
+        # 3. Create new scope with canonical_id
         name = name_override or path.name
-        scope = await create_scope(self._db, name, path_str)
+        scope = await create_scope(
+            self._db, name, path_str, canonical_id=canonical_id,
+        )
         return str(scope["id"])
 
     async def _maybe_schedule_memory_update(self, scope_id: str) -> None:

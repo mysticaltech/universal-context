@@ -54,7 +54,7 @@ class TestSchema:
     async def test_meta_schema_version(self, db: UCDatabase):
         result = await db.query("SELECT * FROM meta:schema")
         assert result
-        assert result[0]["version"] == 2
+        assert result[0]["version"] == 3
 
 
 # ============================================================

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from .client import UCDatabase
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Each statement is a separate list item to avoid semicolon-splitting issues.
 SCHEMA_STATEMENTS: list[str] = [
@@ -21,6 +21,7 @@ SCHEMA_STATEMENTS: list[str] = [
     "DEFINE FIELD IF NOT EXISTS name ON scope TYPE string",
     "DEFINE FIELD IF NOT EXISTS path ON scope TYPE option<string>",
     "DEFINE FIELD IF NOT EXISTS created_at ON scope TYPE datetime DEFAULT time::now()",
+    "DEFINE FIELD IF NOT EXISTS canonical_id ON scope TYPE option<string>",
     "DEFINE FIELD IF NOT EXISTS metadata ON scope TYPE object FLEXIBLE DEFAULT {}",
 
     # Run
@@ -31,6 +32,8 @@ SCHEMA_STATEMENTS: list[str] = [
     "DEFINE FIELD IF NOT EXISTS ended_at ON run TYPE option<datetime>",
     'DEFINE FIELD IF NOT EXISTS status ON run TYPE string DEFAULT "active"',
     "DEFINE FIELD IF NOT EXISTS session_path ON run TYPE option<string>",
+    "DEFINE FIELD IF NOT EXISTS branch ON run TYPE option<string>",
+    "DEFINE FIELD IF NOT EXISTS commit_sha ON run TYPE option<string>",
     "DEFINE FIELD IF NOT EXISTS metadata ON run TYPE object FLEXIBLE DEFAULT {}",
 
     # Turn
@@ -94,7 +97,8 @@ SCHEMA_STATEMENTS: list[str] = [
     # ============================================================
     # INDEXES
     # ============================================================
-    "DEFINE INDEX IF NOT EXISTS idx_scope_path ON scope FIELDS path UNIQUE",
+    "DEFINE INDEX IF NOT EXISTS idx_scope_path ON scope FIELDS path",
+    "DEFINE INDEX IF NOT EXISTS idx_scope_canonical ON scope FIELDS canonical_id UNIQUE",
     "DEFINE INDEX IF NOT EXISTS idx_scope_name ON scope FIELDS name",
     "DEFINE INDEX IF NOT EXISTS idx_run_scope ON run FIELDS scope",
     "DEFINE INDEX IF NOT EXISTS idx_run_status ON run FIELDS status",
@@ -126,7 +130,7 @@ _HNSW_TEMPLATE = (
 )
 
 # Schema version marker (separate — uses UPSERT pattern)
-META_STATEMENT = 'UPSERT meta:schema SET version = 2, updated_at = time::now()'
+META_STATEMENT = 'UPSERT meta:schema SET version = 3, updated_at = time::now()'
 
 
 async def rebuild_hnsw_index(db: UCDatabase, embedding_dim: int = 768) -> bool:
@@ -152,6 +156,9 @@ async def apply_schema(db: UCDatabase, embedding_dim: int = 768) -> None:
         embedding_dim: HNSW index dimension — auto-detected from the embed provider.
                        Default 768 = EmbeddingGemma-300M.
     """
+    # v2 → v3 migration: drop old UNIQUE path index before redefining as non-unique
+    await db.query("REMOVE INDEX IF EXISTS idx_scope_path ON scope")
+
     for statement in SCHEMA_STATEMENTS:
         await db.query(statement)
     if db.is_server:

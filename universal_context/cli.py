@@ -942,6 +942,7 @@ def scope_list(
             table = Table(title="Scopes")
             table.add_column("ID", style="cyan")
             table.add_column("Name", style="bold")
+            table.add_column("Canonical ID", max_width=40, style="dim")
             table.add_column("Path", max_width=40)
             table.add_column("Runs", justify="right")
             table.add_column("Turns", justify="right")
@@ -956,6 +957,7 @@ def scope_list(
                 table.add_row(
                     str(s["id"]),
                     s["name"],
+                    (s.get("canonical_id") or "")[:40],
                     (s.get("path") or "")[:40],
                     str(s.get("run_count", 0)),
                     str(s.get("turn_count", 0)),
@@ -995,6 +997,7 @@ def scope_show(
             console.print(f"[bold]{scope['id']}[/bold]")
             console.print(f"  Name: {scope['name']}")
             console.print(f"  Path: {scope.get('path', '(none)')}")
+            console.print(f"  Canonical ID: {scope.get('canonical_id', '(none)')}")
             console.print(f"  Created: {scope.get('created_at', '')}")
         finally:
             await db.close()
@@ -1010,8 +1013,9 @@ def scope_update_path(
     """Update a scope's filesystem path (e.g. when a project folder moves)."""
 
     async def _update():
-        from .db.queries import update_scope
+        from .db.queries import find_scope_by_canonical_id, merge_scopes, update_scope
         from .db.schema import apply_schema
+        from .git import resolve_canonical_id
 
         resolved = str(new_path.resolve())
         if not new_path.exists():
@@ -1027,8 +1031,25 @@ def scope_update_path(
                 raise typer.Exit(code=1)
 
             sid = str(scope["id"])
-            await update_scope(db, sid, path=resolved)
-            console.print(f"[green]Updated[/green] {sid} path -> {resolved}")
+            canonical_id = resolve_canonical_id(new_path.resolve())
+
+            # Check if another scope already has this canonical_id
+            existing = await find_scope_by_canonical_id(db, canonical_id)
+            if existing and str(existing["id"]) != sid:
+                # Auto-merge into existing scope (same project, different paths)
+                existing_id = str(existing["id"])
+                await merge_scopes(db, sid, existing_id)
+                # Update the surviving scope's path to the new location
+                await update_scope(db, existing_id, path=resolved)
+                console.print(
+                    f"[green]Merged[/green] {sid} into {existing_id} "
+                    f"(shared canonical ID: {canonical_id})"
+                )
+                console.print(f"[dim]Updated path on {existing_id} -> {resolved}[/dim]")
+            else:
+                await update_scope(db, sid, path=resolved, canonical_id=canonical_id)
+                console.print(f"[green]Updated[/green] {sid} path -> {resolved}")
+                console.print(f"[dim]Canonical ID: {canonical_id}[/dim]")
         finally:
             await db.close()
 
@@ -1164,8 +1185,13 @@ def scope_cleanup(
             for s in scopes:
                 path = s.get("path", "") or ""
                 name = s.get("name", "") or ""
+                canonical_id = s.get("canonical_id") or ""
                 is_garbage = False
                 reason = ""
+
+                # Skip scopes with a valid git-backed canonical_id
+                if canonical_id and not canonical_id.startswith("path://"):
+                    continue
 
                 # Date-like directories (e.g. "03", "09", "2025")
                 if re.match(r"^\d{1,4}$", name):
@@ -1321,7 +1347,11 @@ def memory_refresh(
 
     async def _refresh():
         from .config import UCConfig
-        from .db.queries import backfill_artifact_scopes, get_working_memory
+        from .db.queries import (
+            backfill_artifact_scopes,
+            backfill_canonical_ids,
+            get_working_memory,
+        )
         from .db.schema import apply_schema, rebuild_hnsw_index
         from .embed import create_embed_provider
         from .llm import create_llm_fn
@@ -1333,6 +1363,13 @@ def memory_refresh(
         await db.connect()
         try:
             await apply_schema(db)
+
+            # Backfill canonical_ids on scopes (git-aware dedup)
+            cid_backfilled = await backfill_canonical_ids(db)
+            if cid_backfilled and not json_output:
+                console.print(
+                    f"[dim]Backfilled canonical_id on {cid_backfilled} scopes.[/dim]"
+                )
 
             # Backfill scope on any existing artifacts that lack it
             backfilled = await backfill_artifact_scopes(db)
@@ -1621,13 +1658,24 @@ def memory_eject(
 async def _resolve_scope(db: Any, project_path: str) -> dict[str, Any] | None:
     """Resolve a project path to a scope using multiple strategies.
 
-    1. Exact path match
-    2. Name match (if input looks like a name)
-    3. Parent directory walk
+    1. Git-aware canonical_id match
+    2. Exact path match
+    3. Name match (if input looks like a name)
+    4. Parent directory walk
     """
-    from .db.queries import find_scope_by_name, find_scope_by_path
+    from .db.queries import find_scope_by_canonical_id, find_scope_by_name, find_scope_by_path
+    from .git import resolve_canonical_id
 
-    # 1. Exact path match
+    # 1. Git-aware canonical_id match
+    try:
+        canonical_id = resolve_canonical_id(Path(project_path))
+        scope = await find_scope_by_canonical_id(db, canonical_id)
+        if scope:
+            return scope
+    except Exception:
+        pass  # Fall through to path-based resolution
+
+    # 2. Exact path match
     scope = await find_scope_by_path(db, project_path)
     if scope:
         return scope

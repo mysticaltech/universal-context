@@ -42,6 +42,7 @@ ruff format .
 - **SurrealDB graph DB**: `file://` embedded or `ws://` server, graph edges for provenance
 - **Adapter/Trigger pattern**: pluggable per-runtime session detection (Claude, Codex, Gemini)
 - **Summaries are artifacts**: derived, immutable, linked via `depends_on` provenance edges
+- **Git-aware scopes**: canonical_id from git remote URL → worktrees/clones share one scope, branch + commit_sha on runs
 - **Scope-filtered search**: denormalized `scope` field on artifacts for O(1) scope filtering
 - **Self-healing vector search**: HNSW KNN with automatic brute-force cosine fallback
 
@@ -52,6 +53,7 @@ universal_context/
 ├── cli.py                  # Typer CLI (search, ask, context, timeline, inspect, daemon, memory)
 ├── config.py               # UCConfig dataclass, YAML load/save
 ├── embed.py                # EmbedProvider ABC + Local (EmbeddingGemma/ONNX) + OpenAI
+├── git.py                  # Git-aware scope identity (canonical_id, branch, commit_sha)
 ├── llm.py                  # LLM provider factory (Claude, OpenAI, OpenRouter)
 ├── redact.py               # Secret redaction (API keys, tokens, passwords)
 ├── db/
@@ -71,7 +73,8 @@ universal_context/
 ├── tui/                    # Textual dashboard (Overview, Timeline, Search tabs)
 └── models/types.py         # Pydantic domain models + StrEnum types
 
-tests/                      # 233 tests
+tests/                      # 265 tests
+├── test_git.py             # Git URL normalization, canonical_id, branch, cross-worktree
 ├── test_db.py              # Schema, queries, search
 ├── test_search.py          # Scope filtering, embedded fallbacks, RRF
 ├── test_embed.py           # Embedding providers + vector search
@@ -104,6 +107,7 @@ tests/                      # 233 tests
 9. **D9**: Denormalized `scope` on artifacts (avoids graph traversal on search hot path)
 10. **D10**: Embedded search fallbacks — substring match for text, brute-force cosine for vector, Python RRF merge for hybrid
 11. **D11**: HNSW self-healing — `semantic_search()` tries KNN first, falls back to brute-force cosine if index is stale; worker auto-rebuilds HNSW after every 25 new embeddings
+12. **D12**: Git-aware scope identity — canonical_id = normalized git remote URL > git-common-dir > path://. Worktrees and clones of the same repo share one scope. Branch + commit_sha captured on each run for provenance
 
 ## SurrealDB Notes
 

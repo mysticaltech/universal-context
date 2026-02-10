@@ -32,12 +32,18 @@ def _id_str(record: dict[str, Any]) -> str:
 # ============================================================
 
 
-async def create_scope(db: UCDatabase, name: str, path: str | None = None) -> dict[str, Any]:
+async def create_scope(
+    db: UCDatabase,
+    name: str,
+    path: str | None = None,
+    canonical_id: str | None = None,
+) -> dict[str, Any]:
     """Create a new scope."""
     sid = _gen_id()
+    canonical_clause = ", canonical_id = $canonical_id" if canonical_id else ""
     result = await db.query(
-        f"CREATE scope:{sid} SET name = $name, path = $path",
-        {"name": name, "path": path},
+        f"CREATE scope:{sid} SET name = $name, path = $path{canonical_clause}",
+        {"name": name, "path": path, "canonical_id": canonical_id},
     )
     return result[0] if result else {}
 
@@ -59,6 +65,17 @@ async def find_scope_by_path(db: UCDatabase, path: str) -> dict[str, Any] | None
     return result[0] if result else None
 
 
+async def find_scope_by_canonical_id(
+    db: UCDatabase, canonical_id: str,
+) -> dict[str, Any] | None:
+    """Find a scope by its canonical identity (git remote, git-local://, or path://)."""
+    result = await db.query(
+        "SELECT * FROM scope WHERE canonical_id = $cid LIMIT 1",
+        {"cid": canonical_id},
+    )
+    return result[0] if result else None
+
+
 async def find_scope_by_name(
     db: UCDatabase, name: str, limit: int = 10,
 ) -> list[dict[str, Any]]:
@@ -75,8 +92,9 @@ async def update_scope(
     scope_id: str,
     name: str | None = None,
     path: str | None = None,
+    canonical_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Update a scope's name and/or path."""
+    """Update a scope's name, path, and/or canonical_id."""
     sets: list[str] = []
     params: dict[str, Any] = {}
     if name is not None:
@@ -85,6 +103,9 @@ async def update_scope(
     if path is not None:
         sets.append("path = $path")
         params["path"] = path
+    if canonical_id is not None:
+        sets.append("canonical_id = $canonical_id")
+        params["canonical_id"] = canonical_id
     if not sets:
         return await get_scope(db, scope_id)
     result = await db.query(
@@ -136,10 +157,20 @@ async def delete_scope(db: UCDatabase, scope_id: str) -> None:
 async def merge_scopes(
     db: UCDatabase, source_id: str, target_id: str,
 ) -> None:
-    """Move all runs from source scope into target, then delete source."""
+    """Move all runs and artifacts from source scope into target, then delete source."""
     # Re-point runs
     await db.query(
         f"UPDATE run SET scope = {target_id} WHERE scope = {source_id}"
+    )
+    # Re-point artifacts
+    await db.query(
+        f"UPDATE artifact SET scope = {target_id} WHERE scope = {source_id}"
+    )
+    # Re-point working memory metadata references
+    await db.query(
+        "UPDATE artifact SET metadata.scope_id = $tid "
+        "WHERE kind = 'working_memory' AND metadata.scope_id = $sid",
+        {"tid": str(target_id), "sid": str(source_id)},
     )
     # Move graph edges: delete old contains edges, create new ones
     runs = await db.query(f"SELECT id FROM run WHERE scope = {target_id}")
@@ -204,14 +235,25 @@ async def create_run(
     scope_id: str,
     agent_type: str,
     session_path: str | None = None,
+    branch: str | None = None,
+    commit_sha: str | None = None,
 ) -> dict[str, Any]:
     """Create a new run and link it to its scope via RELATE."""
     rid = _gen_id()
-    # Create run first, then create the edge
+    extras = ""
+    if branch:
+        extras += ", branch = $branch"
+    if commit_sha:
+        extras += ", commit_sha = $commit_sha"
     result = await db.query(
         f'CREATE run:{rid} SET scope = {scope_id}, agent_type = $agent_type, '
-        f'status = "active", session_path = $session_path',
-        {"agent_type": agent_type, "session_path": session_path},
+        f'status = "active", session_path = $session_path{extras}',
+        {
+            "agent_type": agent_type,
+            "session_path": session_path,
+            "branch": branch,
+            "commit_sha": commit_sha,
+        },
     )
     run = result[0] if result else {}
     if run:
@@ -917,6 +959,59 @@ async def backfill_artifact_scopes(db: UCDatabase, batch_size: int = 100) -> int
         meta_scope = (wm.get("metadata") or {}).get("scope_id", "")
         if meta_scope and str(meta_scope).startswith("scope:"):
             await db.query(f"UPDATE {wm_id} SET scope = {meta_scope}")
+            count += 1
+
+    return count
+
+
+async def backfill_canonical_ids(db: UCDatabase) -> int:
+    """Backfill canonical_id on scopes that lack it.
+
+    For each scope with a valid filesystem path:
+    1. Compute resolve_canonical_id(path)
+    2. If another scope already has that canonical_id → merge into it
+    3. Otherwise → set the canonical_id
+
+    Returns the number of scopes updated or merged.
+    """
+    import logging
+    from pathlib import Path
+
+    from ..git import resolve_canonical_id
+
+    logger = logging.getLogger(__name__)
+    count = 0
+
+    scopes = await db.query(
+        "SELECT * FROM scope WHERE canonical_id = NONE OR canonical_id = ''"
+    )
+    if not isinstance(scopes, list):
+        return 0
+
+    for scope in scopes:
+        path = scope.get("path")
+        if not path:
+            continue
+
+        scope_id = str(scope["id"])
+        try:
+            canonical_id = resolve_canonical_id(Path(path))
+        except Exception:
+            logger.debug("Failed to resolve canonical_id for %s", path)
+            continue
+
+        # Check if another scope already owns this canonical_id
+        existing = await find_scope_by_canonical_id(db, canonical_id)
+        if existing and str(existing["id"]) != scope_id:
+            # Merge this scope into the existing one
+            logger.info(
+                "Merging scope %s into %s (shared canonical_id: %s)",
+                scope_id, str(existing["id"]), canonical_id,
+            )
+            await merge_scopes(db, scope_id, str(existing["id"]))
+            count += 1
+        else:
+            await update_scope(db, scope_id, canonical_id=canonical_id)
             count += 1
 
     return count

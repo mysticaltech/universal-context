@@ -82,7 +82,24 @@ Persist what was accomplished so future sessions benefit:
 uc memory refresh --project .
 ```
 
-This regenerates the working memory from recent sessions, backfills scope metadata, and rebuilds the vector index. Do this after completing a feature, fixing a major bug, or making architectural decisions.
+This regenerates the working memory from recent sessions, backfills scope metadata (including git-aware canonical IDs), and rebuilds the vector index. Do this after completing a feature, fixing a major bug, or making architectural decisions.
+
+## Git-aware scope resolution
+
+UC uses git remote URLs as canonical scope identity. This means:
+- **Worktrees** of the same repo share one scope (same knowledge base)
+- **Clones** at different paths share one scope (if same remote)
+- **`--project .`** works from any worktree or clone path
+- **Non-git directories** use `path://` fallback (still works normally)
+
+To inspect or manage scopes:
+
+```bash
+uc scope list --json          # shows canonical_id alongside name/path
+uc scope show scope:abc123    # shows canonical_id, path, name
+uc scope update-path <ref> /new/path  # auto-recomputes canonical_id, auto-merges if duplicate
+uc scope cleanup --dry-run    # finds garbage scopes (skips git-backed ones)
+```
 
 To make the memory available to other AI tools (Codex, Gemini):
 
