@@ -59,7 +59,7 @@ Test your change end-to-end. If you changed search, run a search. If you changed
 
 ## Architecture
 
-The full architecture guide lives in [CLAUDE.md](CLAUDE.md). Key pointers:
+The full architecture guide lives in [AGENTS.md](AGENTS.md). Key pointers:
 
 - **Adapter/Trigger pattern** — each AI CLI has an adapter (session discovery) and trigger (turn detection)
 - **Graph provenance** — `RELATE` edges link scope → run → turn → transcript → summary

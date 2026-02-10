@@ -1,13 +1,39 @@
+<div align="center">
+
 # Universal Context
 
 **Your AI agents forget everything. Universal Context fixes that.**
 
-Operational memory for AI coding agents. Captures every session, distills working memory, and gives your agents searchable context across your entire coding history.
+Operational memory for AI coding agents. Captures every session, distills working memory,<br>and gives your agents searchable context across your entire coding history.
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Python 3.13+](https://img.shields.io/badge/Python-3.13+-3776AB.svg)](https://python.org)
+[![Python 3.13+](https://img.shields.io/badge/Python-3.13+-3776AB.svg?logo=python&logoColor=white)](https://python.org)
 [![Tests](https://img.shields.io/badge/Tests-283%20passing-brightgreen.svg)]()
+[![SurrealDB](https://img.shields.io/badge/SurrealDB-v3-6600FF.svg?logo=surrealdb&logoColor=white)](https://surrealdb.com)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa.svg)](https://github.com/sponsors/mysticaltech)
+
+<br>
+
+```
+             ┌─────────────────────────────────────────┐
+             │            UC Daemon                     │
+             │                                         │
+             │   Watcher              Worker           │
+             │   ┌──────────────┐    ┌──────────────┐  │
+             │   │ Claude Code  │    │ Summarizer   │  │
+             │   │ Codex CLI    ├───►│ Embeddings   │  │
+             │   │ Gemini CLI   │    │ Memory       │  │
+             │   └──────┬───────┘    └──────┬───────┘  │
+             │          └──────┬────────────┘          │
+             │                 ▼                        │
+             │          ┌────────────┐                  │
+             │          │ SurrealDB  │                  │
+             │          │ Graph DB   │                  │
+             │          └────────────┘                  │
+             └─────────────────────────────────────────┘
+```
+
+</div>
 
 ---
 
@@ -17,91 +43,102 @@ AI coding agents are stateless. Every session starts from zero. That architectur
 
 ## The Solution
 
-Universal Context runs a background daemon that watches your AI coding sessions across **Claude Code**, **Codex CLI**, and **Gemini CLI**. It captures every turn into a SurrealDB graph database with full provenance, summarizes them via LLM, generates local embeddings, and distills working memory per project. Your agents get searchable, scoped context — keyword, semantic, or hybrid — plus LLM-powered Q&A across your entire history.
-
-```
-                         UC Daemon
-  ┌──────────────────────────────────────────────┐
-  │                                              │
-  │  Watcher                    Worker           │
-  │  ┌────────────────┐        ┌──────────────┐  │
-  │  │ Claude adapter │  jobs  │ Summarizer   │  │
-  │  │ Codex adapter  ├───────►│ (LLM+embed)  │  │
-  │  │ Gemini adapter │        │ Memory       │  │
-  │  └───────┬────────┘        └──────┬───────┘  │
-  │          │     SurrealDB          │          │
-  │          └────────┬───────────────┘          │
-  │                   │                          │
-  └───────────────────┼──────────────────────────┘
-                      │
-              ┌───────▼────────┐
-              │   Graph DB     │
-              │ file:// or ws: │
-              └────────────────┘
-```
+Universal Context runs a background daemon that watches your AI coding sessions, captures every turn into a SurrealDB graph database with full provenance, summarizes them via LLM, generates local embeddings, and distills working memory per project. Your agents get searchable, scoped context — keyword, semantic, or hybrid — plus LLM-powered Q&A across your entire history.
 
 **Local-first.** Your data stays on your machine. No cloud, no telemetry, no third-party storage.
 
+---
+
 ## Supported Tools
 
-| Tool | Status | What UC Captures |
-|------|--------|-----------------|
-| **Claude Code** | Supported | Full JSONL conversation turns, tool calls, file edits |
-| **Codex CLI** | Supported | Event-stream responses, code generation, shell commands |
-| **Gemini CLI** | Supported | JSON array conversations, multi-turn context |
+<table>
+<tr>
+<td align="center" width="33%">
+<br>
+<strong>Claude Code</strong><br>
+<sub>Full JSONL conversation turns<br>Tool calls, file edits, reasoning</sub>
+<br><br>
+</td>
+<td align="center" width="33%">
+<br>
+<strong>Codex CLI</strong><br>
+<sub>Event-stream responses<br>Code generation, shell commands</sub>
+<br><br>
+</td>
+<td align="center" width="33%">
+<br>
+<strong>Gemini CLI</strong><br>
+<sub>JSON array conversations<br>Multi-turn context</sub>
+<br><br>
+</td>
+</tr>
+</table>
 
-More adapters welcome — [send a PR](#contributing).
+> More adapters welcome — [send a PR](#contributing).
+
+---
 
 ## Features
 
+<table>
+<tr>
+<td width="50%" valign="top">
+
 ### Search & Retrieval
 - **BM25 full-text search** — keyword search with relevance ranking
-- **Semantic vector search** — find conceptually related sessions using local embeddings (EmbeddingGemma-300M, no API keys)
-- **Hybrid search** — RRF fusion of keyword + semantic results
-- **Scope filtering** — search within a single project or across everything
+- **Semantic vector search** — local embeddings, no API keys needed
+- **Hybrid search** — RRF fusion of keyword + semantic
+- **Scope filtering** — search within a project or across everything
 - **Branch filtering** — scope queries to a specific git branch
 
 ### Working Memory
-- **Auto-distilled project memory** — LLM summarizes your project's accumulated knowledge into a concise brief
-- **Injectable** — pipe working memory directly into agent config files (`CLAUDE.md`, `AGENTS.md`)
-- **Refreshable** — regenerate memory on demand as your project evolves
+- **Auto-distilled** — LLM summarizes accumulated project knowledge
+- **Injectable** — pipe memory into `CLAUDE.md`, `AGENTS.md`, etc.
+- **Refreshable** — regenerate on demand as your project evolves
 
 ### Context & Q&A
-- **LLM-powered Q&A** — ask natural language questions about any project ("How does the auth middleware work?")
-- **Context retrieval** — get relevant past sessions for a task description, formatted for agent consumption
-- **JSON output** — every command supports `--json` for machine-readable output
+- **Natural language Q&A** — "How does the auth middleware work?"
+- **Context retrieval** — relevant sessions for a task description
+- **JSON output** — every command supports `--json`
+
+</td>
+<td width="50%" valign="top">
 
 ### Git-Aware Intelligence
-- **Scope identity** — worktrees and clones of the same repo automatically share one knowledge scope
-- **Branch tracking** — every captured run records its branch and commit SHA
-- **Merge detection** — UC detects when feature branch commits land on main
-- **Cross-machine sharing** — export/import bundles with scope metadata for team knowledge transfer
+- **Scope identity** — worktrees and clones share one knowledge scope
+- **Branch tracking** — every run records its branch + commit SHA
+- **Merge detection** — detects when feature branches land on main
+- **Cross-machine sharing** — export/import bundles with scope metadata
 
 ### Data Integrity
-- **Graph provenance** — every artifact linked via `RELATE` edges: summaries → transcripts → turns → runs → scopes
-- **Secret redaction** — API keys, tokens, and passwords stripped before storage
+- **Graph provenance** — full `RELATE` edge chain from scope to summary
+- **Secret redaction** — API keys, tokens, passwords stripped on capture
 - **Immutable artifacts** — summaries are derived, never mutated
 
-### Local-First Operation
-- **Zero API keys required** — embedded DB + local ONNX embeddings work out of the box
-- **Optional LLM enhancement** — add OpenRouter, Claude, or OpenAI keys for better summaries and Q&A
-- **Optional SurrealDB server** — upgrade to full BM25 + HNSW vector search when you want it
+### Local-First by Default
+- **Zero API keys required** — embedded DB + local ONNX embeddings
+- **Optional LLM** — add an API key for better summaries and Q&A
+- **Optional DB server** — upgrade to BM25 + HNSW when ready
+- **TUI dashboard** — interactive overview, timeline, and search
 
-### Tools
-- **TUI dashboard** — Textual-based interactive dashboard with Overview, Timeline, and Search tabs
-- **CLI** — comprehensive command-line interface for all operations
-- **Health checks** — `uc doctor` validates your setup and reports issues
+</td>
+</tr>
+</table>
+
+---
 
 ## Setup — Give This to Your Agent
 
-> **The recommended way to set up UC is to paste this section into Claude Code, Codex, or any AI coding agent and tell it: "Install Universal Context for me."**
+> **The recommended way to set up UC is to paste this README into Claude Code, Codex, or any AI coding agent and tell it: "Install Universal Context for me."**
+>
+> Your agent can handle the entire setup autonomously.
 
-Your agent can handle the entire setup. But if you prefer doing it yourself:
+If you prefer doing it yourself:
 
 ### Prerequisites
 
-- **Python 3.13+** ([python.org](https://python.org) or `brew install python@3.13`)
-- **uv** ([docs.astral.sh/uv](https://docs.astral.sh/uv/)) — `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- **Python 3.13+** — `brew install python@3.13` or [python.org](https://python.org)
+- **uv** — `curl -LsSf https://astral.sh/uv/install.sh | sh` ([docs](https://docs.astral.sh/uv/))
 
 ### Install
 
@@ -122,34 +159,49 @@ uc daemon start -f
 
 That's it. UC is now watching your AI coding sessions and building your operational memory.
 
+---
+
 ## SurrealDB Setup
 
 UC works in two modes:
 
-| Mode | Search | Setup | Best For |
-|------|--------|-------|----------|
-| **Embedded** (`file://`) | Substring + brute-force cosine | Zero config | Getting started, small history |
-| **Server** (`ws://`) | BM25 full-text + HNSW vector KNN | 2 minutes | Production, large history |
+| Mode | Search Capabilities | Setup |
+|------|-------------------|-------|
+| **Embedded** (`file://`) | Substring match + brute-force cosine | Zero config — works out of the box |
+| **Server** (`ws://`) | BM25 full-text + HNSW vector KNN | 2 minutes — full-power search |
 
-The embedded mode works immediately with no extra setup. When you're ready for full-power search:
+The embedded mode works immediately. When you're ready for full-power search, you have two options:
+
+### Option A: Local Server
 
 ```bash
 # Install SurrealDB v3
 curl -sSf https://install.surrealdb.com | sh
 
-# Start the server (runs on port 8000)
+# Start the server
 surreal start --bind 127.0.0.1:8000 --user root --pass root surrealkv://~/.surrealdb/data
 ```
 
-Then point UC at it in `~/.uc/config.yaml`:
+### Option B: SurrealDB Cloud (Free Tier)
+
+Don't want to run a local server? [SurrealDB Cloud](https://surrealdb.com/cloud) offers a free tier (1 GB storage, no credit card) — ideal for getting started:
+
+1. Sign up at [surrealdb.com](https://surrealdb.com/cloud)
+2. Create a database instance
+3. Use the provided `wss://` endpoint in your UC config
+
+### Point UC at Your Server
 
 ```yaml
-db_url: "ws://127.0.0.1:8000"
+# ~/.uc/config.yaml
+db_url: "ws://127.0.0.1:8000"   # or wss://your-instance.surrealdb.cloud
 db_user: "root"
 db_pass: "root"
 ```
 
-**What you get with the server:** BM25 full-text search with relevance ranking, HNSW approximate nearest neighbor search for semantic queries, and automatic index rebuilds. Without it, search still works via substring matching and brute-force cosine similarity — just slower at scale.
+**What you get:** BM25 full-text search with relevance ranking, HNSW approximate nearest neighbor search for semantic queries, and automatic index rebuilds.
+
+---
 
 ## Configuration
 
@@ -157,7 +209,7 @@ db_pass: "root"
 
 ```yaml
 # LLM for summarization and Q&A
-# Extractive fallback used when no LLM key is configured
+# Works without any API key (extractive fallback), but much better with one
 llm_provider: "openrouter"     # openrouter | claude | openai | auto
 llm_model: ""                  # empty = provider default
 
@@ -177,28 +229,35 @@ db_pass: "root"
 # Which AI CLIs to watch
 auto_detect_claude: true
 auto_detect_codex: true
-auto_detect_gemini: false       # opt-in
+auto_detect_gemini: true
 ```
 
 ### LLM Providers
 
-| Provider | Model | Env Var | Notes |
-|----------|-------|---------|-------|
-| `openrouter` | Provider default | `OPENROUTER_API_KEY` | Multi-model gateway, recommended |
-| `claude` | Claude (Anthropic) | `ANTHROPIC_API_KEY` | Direct Anthropic API |
-| `openai` | GPT series | `OPENAI_API_KEY` | OpenAI API |
-| `auto` | Best available | Any of the above | Tries providers in order |
+| Provider | Env Var | Notes |
+|----------|---------|-------|
+| `openrouter` | `OPENROUTER_API_KEY` | **Recommended.** Multi-model gateway — one key, any model |
+| `claude` | `ANTHROPIC_API_KEY` | Direct Anthropic API |
+| `openai` | `OPENAI_API_KEY` | Direct OpenAI API |
+| `auto` | Any of the above | Tries providers in priority order |
+
+> **Recommended model:** Set `llm_model: "xai/grok-4.1-fast"` via OpenRouter. Fast, cheap, excellent at summarization. The default (Claude Haiku 4.5) works great too.
 
 ### Embedding Providers
 
-| Provider | Model | Dims | API Key | Notes |
-|----------|-------|------|---------|-------|
-| `local` | EmbeddingGemma-300M | 768 | None | ONNX Runtime, ~600MB download on first use |
-| `openai` | text-embedding-3-small | 1536 | `OPENAI_API_KEY` | Higher quality, requires API key |
+| Provider | Model | Dims | API Key Required |
+|----------|-------|------|:---:|
+| `local` | EmbeddingGemma-300M (ONNX) | 768 | No |
+| `openai` | text-embedding-3-small | 1536 | Yes |
+
+The local model downloads ~600MB on first use and caches at `~/.cache/uc-models/`. No API keys, no PyTorch — pure ONNX inference.
+
+---
 
 ## CLI Reference
 
-### Search & Context
+<details>
+<summary><strong>Search & Context</strong></summary>
 
 ```bash
 uc search "query"                          # Keyword search (BM25)
@@ -210,7 +269,10 @@ uc context --project . --branch main       # Branch-filtered context
 uc ask "question" --project .              # LLM-powered Q&A
 ```
 
-### Working Memory
+</details>
+
+<details>
+<summary><strong>Working Memory</strong></summary>
 
 ```bash
 uc memory show --project .                 # View distilled project memory
@@ -221,7 +283,10 @@ uc memory eject --project .                # Remove injected memory
 uc memory history --project .              # View memory versions
 ```
 
-### Daemon
+</details>
+
+<details>
+<summary><strong>Daemon & Status</strong></summary>
 
 ```bash
 uc daemon start                            # Start in background
@@ -231,7 +296,10 @@ uc status                                  # System overview
 uc doctor                                  # Health check
 ```
 
-### Inspect & Timeline
+</details>
+
+<details>
+<summary><strong>Inspect & Timeline</strong></summary>
 
 ```bash
 uc timeline                                # Turns in latest run
@@ -240,7 +308,10 @@ uc inspect turn:abc123                     # Full provenance chain for a turn
 uc dashboard                               # Interactive TUI
 ```
 
-### Sharing & Scopes
+</details>
+
+<details>
+<summary><strong>Sharing & Scopes</strong></summary>
 
 ```bash
 uc share export run:abc123 -o bundle.json  # Export a run as v2 bundle
@@ -251,7 +322,11 @@ uc scope cleanup --dry-run                 # Find orphaned scopes
 uc rebuild-index                           # Rebuild HNSW vector index
 ```
 
-Every command supports `--json` for machine-readable output.
+</details>
+
+> Every command supports `--json` for machine-readable output.
+
+---
 
 ## Architecture
 
@@ -262,65 +337,75 @@ Every command supports `--json` for machine-readable output.
 │  ┌─────────────────────────┐    ┌───────────────────────────┐   │
 │  │        Watcher          │    │         Worker            │   │
 │  │                         │    │                           │   │
-│  │  ┌───────────────────┐  │    │  ┌─────────────────────┐  │   │
-│  │  │ Adapters          │  │    │  │ TurnSummarizer      │  │   │
-│  │  │  Claude (.jsonl)  │  │    │  │  LLM summarize      │  │   │
-│  │  │  Codex  (events)  │  │    │  │  Embed (ONNX/API)   │  │   │
-│  │  │  Gemini (.json)   │  │    │  │  Scope propagation  │  │   │
-│  │  └────────┬──────────┘  │    │  └─────────────────────┘  │   │
-│  │           │             │    │  ┌─────────────────────┐  │   │
-│  │  ┌────────▼──────────┐  │    │  │ MemoryProcessor     │  │   │
-│  │  │ Triggers          │  │    │  │  LLM distillation   │  │   │
-│  │  │  Turn detection   │──┼────┼─►│  Project memory     │  │   │
-│  │  │  Turn ingestion   │  │jobs│  └─────────────────────┘  │   │
-│  │  └───────────────────┘  │    │  ┌─────────────────────┐  │   │
-│  │                         │    │  │ HNSW Rebuilder       │  │   │
-│  │  Git: branch, commit,   │    │  │  Auto every 25 new  │  │   │
-│  │  canonical_id, merges   │    │  │  embeddings          │  │   │
-│  └─────────────────────────┘    │  └─────────────────────┘  │   │
-│                                 └───────────────────────────┘   │
-│                          │                                      │
-│                   ┌──────▼──────┐                               │
-│                   │  SurrealDB  │                               │
-│                   │  Graph DB   │                               │
-│                   └─────────────┘                               │
+│  │  Adapters               │    │  TurnSummarizer           │   │
+│  │   Claude (.jsonl)       │    │   LLM summarize           │   │
+│  │   Codex  (events)       │    │   Embed (ONNX/API)        │   │
+│  │   Gemini (.json)        │    │   Scope propagation       │   │
+│  │         │               │    │                           │   │
+│  │  Triggers               │    │  MemoryProcessor          │   │
+│  │   Turn detection ───────┼────┼─► LLM distillation        │   │
+│  │   Turn ingestion        │jobs│   Project memory          │   │
+│  │                         │    │                           │   │
+│  │  Git awareness          │    │  HNSW Rebuilder           │   │
+│  │   Branch, commit SHA    │    │   Auto every 25 embeds    │   │
+│  │   Canonical ID, merges  │    │                           │   │
+│  └─────────────────────────┘    └───────────────────────────┘   │
+│                                                                 │
+│                       ┌─────────────┐                           │
+│                       │  SurrealDB  │                           │
+│                       │  Graph DB   │                           │
+│                       └─────────────┘                           │
 └─────────────────────────────────────────────────────────────────┘
 
-Storage: scope ← run ← turn ← transcript ← summary (all RELATE edges)
-Search:  BM25 full-text │ HNSW vector KNN │ brute-force cosine fallback
+Provenance: scope ← run ← turn ← transcript ← summary  (all RELATE edges)
+Search:     BM25 full-text │ HNSW vector KNN │ brute-force cosine fallback
 ```
 
 ### Key Design Decisions
 
-- **Single-process daemon** — RocksDB fcntl lock prevents multi-process; watcher + worker run as async task groups
-- **Graph provenance** — `RELATE` edges link every artifact to its source, fully traversable
-- **Immutable summaries** — derived artifacts linked via `depends_on` edges, never mutated
-- **Git-aware scopes** — canonical_id from git remote URL means worktrees and clones share knowledge
-- **Self-healing search** — HNSW KNN with automatic brute-force cosine fallback when index is stale
-- **Denormalized scope** — scope field on artifacts avoids graph traversal on the search hot path
+| Decision | Rationale |
+|----------|-----------|
+| Single-process daemon | RocksDB fcntl lock; watcher + worker as async task groups |
+| Graph provenance | `RELATE` edges link every artifact to its source, fully traversable |
+| Immutable summaries | Derived artifacts linked via `depends_on` edges, never mutated |
+| Git-aware scopes | canonical_id from git remote URL — worktrees and clones share knowledge |
+| Self-healing search | HNSW KNN with automatic brute-force cosine fallback |
+| Denormalized scope | Scope field on artifacts avoids graph traversal on search hot path |
 
-For the full architecture guide, see [CLAUDE.md](CLAUDE.md).
+For the full architecture guide, see [AGENTS.md](AGENTS.md).
+
+---
 
 ## Contributing
 
 **PRs, not issues.** We don't use GitHub Issues for bug reports. If you found a bug, fix it and send a PR. If you want to add a feature, send a PR.
 
-Every PR must pass triple verification:
+Every PR must pass **triple verification**:
 
-1. **Tests pass** — `pytest -x -v` (283+ tests)
-2. **Lint clean** — `ruff check . && ruff format --check .`
-3. **Manual test** — verify your change works end-to-end
+| Check | Command |
+|-------|---------|
+| Tests pass | `pytest -x -v` (283+ tests) |
+| Lint clean | `ruff check . && ruff format --check .` |
+| Manual test | Verify your change works end-to-end |
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide.
+
+---
+
+<div align="center">
 
 ## Support the Project
 
 If Universal Context saves you time, consider sponsoring to keep it maintained and evolving.
 
+<br>
+
 <a href="https://github.com/sponsors/mysticaltech">
   <img src="https://img.shields.io/badge/Sponsor_on_GitHub-%E2%9D%A4-ea4aaa?style=for-the-badge&logo=github" alt="Sponsor on GitHub">
 </a>
 
-## License
+<br><br>
 
 [Apache 2.0](LICENSE)
+
+</div>
