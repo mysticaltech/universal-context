@@ -156,3 +156,93 @@ class TestBundle:
             assert "uc-bundle" in result.name
         finally:
             os.chdir(original_cwd)
+
+    async def test_export_v2_has_scope_metadata(self, db: UCDatabase, tmp_path: Path):
+        """v2 bundles should include scope metadata."""
+        _, run_id, _ = await _make_run_with_turns(db)
+        out = tmp_path / "bundle.json"
+        await export_bundle(db, run_id, output_path=out)
+
+        import json
+        bundle = json.loads(out.read_text())
+        assert bundle["version"] == 2
+        assert bundle.get("scope") is not None
+        assert bundle["scope"].get("name") == "proj"
+
+    async def test_import_v2_matches_scope_by_canonical_id(
+        self, db: UCDatabase, tmp_path: Path,
+    ):
+        """v2 import should match existing scope by canonical_id."""
+        from universal_context.db.queries import update_scope
+
+        scope_id, run_id, _ = await _make_run_with_turns(db)
+        # Set a canonical_id on the scope
+        await update_scope(db, scope_id, canonical_id="github.com/user/proj")
+
+        # Export
+        out = tmp_path / "bundle.json"
+        await export_bundle(db, run_id, output_path=out)
+
+        # Import without explicit target — should match by canonical_id
+        result = await import_bundle(db, out)
+        assert result["scope_id"] == scope_id
+        assert result["turns_imported"] == 2
+
+    async def test_import_with_explicit_target_scope(
+        self, db: UCDatabase, tmp_path: Path,
+    ):
+        """Import with explicit target_scope_id should use that scope."""
+        from universal_context.db.queries import create_scope as cs
+
+        scope_id, run_id, _ = await _make_run_with_turns(db)
+        out = tmp_path / "bundle.json"
+        await export_bundle(db, run_id, output_path=out)
+
+        # Create a different target scope
+        target = await cs(db, "target-proj", "/tmp/target")
+        target_id = str(target["id"])
+
+        result = await import_bundle(db, out, target_scope_id=target_id)
+        assert result["scope_id"] == target_id
+
+    async def test_import_v1_compat(self, db: UCDatabase, tmp_path: Path):
+        """v1 bundles (no scope metadata) should create throwaway scope."""
+        import json
+
+        # Create a v1 bundle manually
+        v1_bundle = {
+            "version": 1,
+            "exported_at": "2025-01-01T00:00:00",
+            "run": {
+                "id": "run:old123",
+                "agent_type": "claude",
+                "scope": "scope:old",
+                "status": "completed",
+            },
+            "turns": [
+                {"id": "turn:t1", "sequence": 1, "user_message": "hello"},
+            ],
+            "artifacts": [
+                {"id": "artifact:a1", "kind": "transcript", "content": "hello world"},
+            ],
+        }
+        out = tmp_path / "v1-bundle.json"
+        out.write_text(json.dumps(v1_bundle))
+
+        result = await import_bundle(db, out)
+        assert result["turns_imported"] == 1
+        # Should have created a throwaway import-xxx scope
+        assert result["scope_id"].startswith("scope:")
+
+    async def test_import_unsupported_version_raises(
+        self, db: UCDatabase, tmp_path: Path,
+    ):
+        """Bundles with unsupported version should raise."""
+        import json
+
+        bad_bundle = {"version": 99}
+        out = tmp_path / "bad.json"
+        out.write_text(json.dumps(bad_bundle))
+
+        with pytest.raises(ValueError, match="Unsupported bundle version"):
+            await import_bundle(db, out)

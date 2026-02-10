@@ -279,9 +279,10 @@ async def list_runs(
     db: UCDatabase,
     scope_id: str | None = None,
     status: str | None = None,
+    branch: str | None = None,
     limit: int = 50,
 ) -> list[dict[str, Any]]:
-    """List runs, optionally filtered by scope and/or status."""
+    """List runs, optionally filtered by scope, status, and/or branch."""
     conditions = []
     params: dict[str, Any] = {}
     if scope_id:
@@ -289,6 +290,9 @@ async def list_runs(
     if status:
         conditions.append("status = $status")
         params["status"] = status
+    if branch:
+        conditions.append("branch = $branch")
+        params["branch"] = branch
 
     where = " WHERE " + " AND ".join(conditions) if conditions else ""
     return await db.query(
@@ -861,16 +865,18 @@ async def get_working_memory_history(
 
 
 async def get_scope_summaries_for_distillation(
-    db: UCDatabase, scope_id: str, limit: int = 30,
+    db: UCDatabase, scope_id: str, limit: int = 30, branch: str | None = None,
 ) -> list[dict[str, Any]]:
     """Get recent turn summaries across all runs in a scope.
 
     Walks: scope -> runs -> turns -> produced -> transcript <- depends_on <- summary.
     Returns a flat list of dicts with run context for LLM distillation.
     """
-    # Get runs for scope, newest first
+    # Get runs for scope, newest first, optionally filtered by branch
+    branch_filter = " AND branch = $branch" if branch else ""
     runs = await db.query(
-        f"SELECT * FROM run WHERE scope = {scope_id} ORDER BY started_at DESC"
+        f"SELECT * FROM run WHERE scope = {scope_id}{branch_filter} ORDER BY started_at DESC",
+        {"branch": branch} if branch else {},
     )
 
     results: list[dict[str, Any]] = []
@@ -983,7 +989,7 @@ async def backfill_canonical_ids(db: UCDatabase) -> int:
     count = 0
 
     scopes = await db.query(
-        "SELECT * FROM scope WHERE canonical_id = NONE OR canonical_id = ''"
+        "SELECT * FROM scope WHERE !canonical_id"
     )
     if not isinstance(scopes, list):
         return 0
@@ -1014,6 +1020,52 @@ async def backfill_canonical_ids(db: UCDatabase) -> int:
             await update_scope(db, scope_id, canonical_id=canonical_id)
             count += 1
 
+    return count
+
+
+async def detect_merged_runs(
+    db: UCDatabase,
+    scope_id: str,
+    current_branch: str,
+    repo_path: Any,
+) -> int:
+    """Tag runs from other branches whose commits are ancestors of current_branch.
+
+    For each run on a different branch with a commit_sha, checks whether that
+    commit has been merged into current_branch using git merge-base --is-ancestor.
+    Sets merged_to on matching runs.
+
+    Returns the number of runs tagged.
+    """
+    import asyncio
+    from pathlib import Path
+
+    from ..git import is_ancestor
+
+    runs = await db.query(
+        f"SELECT * FROM run WHERE scope = {scope_id} "
+        "AND branch != $branch AND !!branch "
+        "AND !!commit_sha AND !merged_to",
+        {"branch": current_branch},
+    )
+    if not isinstance(runs, list):
+        return 0
+
+    count = 0
+    for run in runs:
+        commit = run.get("commit_sha")
+        if not commit:
+            continue
+        ancestor = await asyncio.to_thread(
+            is_ancestor, Path(str(repo_path)), commit, current_branch,
+        )
+        if ancestor:
+            run_id = str(run["id"])
+            await db.query(
+                f"UPDATE {run_id} SET merged_to = $branch",
+                {"branch": current_branch},
+            )
+            count += 1
     return count
 
 

@@ -248,3 +248,62 @@ class TestContextJson:
         output = json.dumps(payload)
         parsed = json.loads(output)
         assert parsed["error"] == "no_scope"
+
+    @pytest.mark.asyncio
+    async def test_context_branch_filter(self, db, populated_db):
+        """--branch should filter runs and include branch/commit_sha in output."""
+        info = populated_db
+
+        scope = await find_scope_by_path(db, info["path"])
+        scope_id = str(scope["id"])
+
+        # The populated_db creates runs without branch — add one with branch
+        run_main = await create_run(
+            db, scope_id, "claude", branch="main", commit_sha="abc1234",
+        )
+        main_run_id = str(run_main["id"])
+        await create_turn_with_artifact(
+            db, main_run_id, 1, "main work",
+            "User: main work\nAssistant: done",
+            create_summary_job=False,
+        )
+
+        run_feat = await create_run(
+            db, scope_id, "claude", branch="feature/x", commit_sha="def5678",
+        )
+        feat_run_id = str(run_feat["id"])
+        await create_turn_with_artifact(
+            db, feat_run_id, 1, "feature work",
+            "User: feature work\nAssistant: done",
+            create_summary_job=False,
+        )
+
+        # Filter by main branch
+        runs_main = await list_runs(db, scope_id=scope_id, branch="main")
+        assert len(runs_main) == 1
+        assert str(runs_main[0]["id"]) == main_run_id
+
+        # Build run_details the same way as the CLI
+        run_details = []
+        for r in runs_main:
+            rid = str(r["id"])
+            summaries = await get_turn_summaries(db, rid, limit=10)
+            run_details.append({
+                "run_id": rid,
+                "agent_type": r.get("agent_type", ""),
+                "branch": r.get("branch"),
+                "commit_sha": r.get("commit_sha"),
+                "merged_to": r.get("merged_to"),
+                "total_turns": len(summaries),
+            })
+
+        payload = {
+            "scope": _sanitize_record(scope),
+            "runs": run_details,
+        }
+        output = json.dumps(payload, default=str)
+        parsed = json.loads(output)
+
+        assert len(parsed["runs"]) == 1
+        assert parsed["runs"][0]["branch"] == "main"
+        assert parsed["runs"][0]["commit_sha"] == "abc1234"

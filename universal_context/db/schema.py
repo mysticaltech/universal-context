@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from .client import UCDatabase
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Each statement is a separate list item to avoid semicolon-splitting issues.
 SCHEMA_STATEMENTS: list[str] = [
@@ -34,6 +34,7 @@ SCHEMA_STATEMENTS: list[str] = [
     "DEFINE FIELD IF NOT EXISTS session_path ON run TYPE option<string>",
     "DEFINE FIELD IF NOT EXISTS branch ON run TYPE option<string>",
     "DEFINE FIELD IF NOT EXISTS commit_sha ON run TYPE option<string>",
+    "DEFINE FIELD IF NOT EXISTS merged_to ON run TYPE option<string>",
     "DEFINE FIELD IF NOT EXISTS metadata ON run TYPE object FLEXIBLE DEFAULT {}",
 
     # Turn
@@ -130,7 +131,7 @@ _HNSW_TEMPLATE = (
 )
 
 # Schema version marker (separate — uses UPSERT pattern)
-META_STATEMENT = 'UPSERT meta:schema SET version = 3, updated_at = time::now()'
+META_STATEMENT = 'UPSERT meta:schema SET version = 4, updated_at = time::now()'
 
 
 async def rebuild_hnsw_index(db: UCDatabase, embedding_dim: int = 768) -> bool:

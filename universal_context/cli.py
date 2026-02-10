@@ -225,6 +225,9 @@ def search(
 @app.command()
 def timeline(
     run_id: str | None = typer.Argument(None, help="Run ID (omit for latest)"),
+    branch: str | None = typer.Option(
+        None, "--branch", "-b", help="Filter runs by git branch (used when no run_id)"
+    ),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
 ) -> None:
     """Show chronological timeline of a run."""
@@ -239,7 +242,7 @@ def timeline(
             await apply_schema(db)
 
             if run_id is None:
-                runs = await list_runs(db, limit=1)
+                runs = await list_runs(db, branch=branch, limit=1)
                 if not runs:
                     if json_output:
                         print(json_mod.dumps(
@@ -406,6 +409,9 @@ def context(
         None, "--context", "-c",
         help="Semantic context — describe what you're working on for embedding-based retrieval",
     ),
+    branch: str | None = typer.Option(
+        None, "--branch", "-b", help="Filter runs by git branch"
+    ),
     limit: int = typer.Option(5, "--limit", "-n", help="Max runs to show"),
     turns: int = typer.Option(10, "--turns", "-t", help="Max turns per run"),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
@@ -447,7 +453,9 @@ def context(
                 return
 
             scope_id = str(scope["id"])
-            runs_data = await list_runs(db, scope_id=scope_id, limit=limit)
+            runs_data = await list_runs(
+                db, scope_id=scope_id, branch=branch, limit=limit,
+            )
 
             # Build run details with summaries
             run_details = []
@@ -459,6 +467,9 @@ def context(
                     "agent_type": r.get("agent_type", ""),
                     "status": r.get("status", ""),
                     "started_at": r.get("started_at"),
+                    "branch": r.get("branch"),
+                    "commit_sha": r.get("commit_sha"),
+                    "merged_to": r.get("merged_to"),
                     "total_turns": len(summaries),
                     "turns": summaries,
                 })
@@ -847,17 +858,64 @@ def share_export(
     run_id: str = typer.Argument(..., help="Run ID to export"),
     output: Path | None = typer.Option(None, "--output", "-o", help="Output path"),
     encrypt: bool = typer.Option(False, "--encrypt", "-e", help="Encrypt the bundle"),
+    passphrase: str | None = typer.Option(None, "--passphrase", help="Encryption passphrase"),
 ) -> None:
-    """Export a run as a portable share bundle."""
-    console.print("[yellow]Share export requires Phase 7.[/yellow]")
+    """Export a run as a portable share bundle (v2 with scope metadata)."""
+
+    async def _export():
+        from .db.schema import apply_schema
+        from .sharing.bundle import export_bundle
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+            pw = passphrase if encrypt else None
+            result = await export_bundle(db, run_id, output_path=output, passphrase=pw)
+            console.print(f"[green]Exported bundle:[/green] {result}")
+        finally:
+            await db.close()
+
+    _run_async(_export())
 
 
 @share_app.command("import")
 def share_import(
     bundle: Path = typer.Argument(..., help="Path to share bundle"),
+    project: Path | None = typer.Option(
+        None, "--project", "-p", help="Import into this project's scope"
+    ),
+    passphrase: str | None = typer.Option(None, "--passphrase", help="Decryption passphrase"),
 ) -> None:
     """Import a share bundle into the local database."""
-    console.print("[yellow]Share import requires Phase 7.[/yellow]")
+
+    async def _import():
+        from .db.schema import apply_schema
+        from .sharing.bundle import import_bundle
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+
+            target_scope_id = None
+            if project is not None:
+                scope = await _resolve_scope(db, str(project.resolve()))
+                if scope:
+                    target_scope_id = str(scope["id"])
+
+            result = await import_bundle(
+                db, bundle, passphrase=passphrase, target_scope_id=target_scope_id,
+            )
+            console.print(
+                f"[green]Imported:[/green] {result['turns_imported']} turns, "
+                f"{result['artifacts_imported']} artifacts -> {result['run_id']}"
+            )
+            console.print(f"[dim]Scope: {result['scope_id']}[/dim]")
+        finally:
+            await db.close()
+
+    _run_async(_import())
 
 
 # --- Config sub-commands ---

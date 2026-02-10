@@ -24,10 +24,12 @@ async def export_bundle(
     output_path: Path | None = None,
     passphrase: str | None = None,
 ) -> Path:
-    """Export a run as a portable share bundle.
+    """Export a run as a portable v2 share bundle with scope metadata.
 
     Returns the path to the created bundle file.
     """
+    from ..db.queries import get_scope
+
     run = await get_run(db, run_id)
     if not run:
         raise ValueError(f"Run not found: {run_id}")
@@ -50,13 +52,22 @@ async def export_bundle(
                     if isinstance(art, dict):
                         artifacts.append(_serialize_record(art))
 
-    # Build bundle
+    # Resolve scope metadata for cross-machine sharing
+    run_scope = run.get("scope")
+    scope_data = None
+    if run_scope:
+        scope_record = await get_scope(db, str(run_scope))
+        if scope_record:
+            scope_data = _serialize_record(scope_record)
+
+    # Build v2 bundle with scope metadata
     bundle = {
-        "version": 1,
+        "version": 2,
         "exported_at": datetime.now().isoformat(),
         "run": _serialize_record(run),
         "turns": [_serialize_record(t) for t in turns],
         "artifacts": artifacts,
+        "scope": scope_data,
     }
 
     payload = json.dumps(bundle, indent=2, default=str)
@@ -77,8 +88,14 @@ async def import_bundle(
     db: UCDatabase,
     bundle_path: Path,
     passphrase: str | None = None,
+    target_scope_id: str | None = None,
 ) -> dict[str, Any]:
     """Import a share bundle into the local database.
+
+    Smart scope resolution:
+    1. If target_scope_id provided → use it (explicit --project)
+    2. If bundle v2 has scope.canonical_id → look up by canonical_id
+    3. Fallback → create import-{id} scope (v1 backwards compat)
 
     Returns summary of imported records.
     """
@@ -89,38 +106,59 @@ async def import_bundle(
 
     bundle = json.loads(payload)
 
-    if bundle.get("version") != 1:
-        raise ValueError(f"Unsupported bundle version: {bundle.get('version')}")
+    version = bundle.get("version")
+    if version not in (1, 2):
+        raise ValueError(f"Unsupported bundle version: {version}")
 
-    # Import run
     run_data = bundle["run"]
-    from ..db.queries import _gen_id
 
-    new_run_id = _gen_id()
-    run_data.get("scope", "imported")
+    from ..db.queries import (
+        _gen_id,
+        create_run,
+        create_scope,
+        create_turn_with_artifact,
+        find_scope_by_canonical_id,
+        get_scope,
+    )
 
-    # Create scope for imported run
-    from ..db.queries import create_scope
+    # Resolve target scope
+    scope_id = None
 
-    scope = await create_scope(db, f"import-{new_run_id[:6]}")
-    scope_id = str(scope["id"])
+    # 1. Explicit target
+    if target_scope_id:
+        scope = await get_scope(db, target_scope_id)
+        if scope:
+            scope_id = str(scope["id"])
 
-    from ..db.queries import create_run
+    # 2. Bundle v2 scope metadata — match by canonical_id
+    if scope_id is None and version == 2:
+        bundle_scope = bundle.get("scope")
+        if bundle_scope and bundle_scope.get("canonical_id"):
+            existing = await find_scope_by_canonical_id(
+                db, bundle_scope["canonical_id"],
+            )
+            if existing:
+                scope_id = str(existing["id"])
+
+    # 3. Fallback — create throwaway scope
+    if scope_id is None:
+        new_id = _gen_id()
+        scope = await create_scope(db, f"import-{new_id[:6]}")
+        scope_id = str(scope["id"])
 
     run = await create_run(
         db,
         scope_id,
         run_data.get("agent_type", "unknown"),
+        branch=run_data.get("branch"),
+        commit_sha=run_data.get("commit_sha"),
     )
     imported_run_id = str(run["id"])
 
     # Import turns + artifacts
     imported_turns = 0
-    imported_artifacts = 0
 
     for turn_data in bundle.get("turns", []):
-        from ..db.queries import create_turn_with_artifact
-
         raw_content = ""
         # Find matching artifact
         for art in bundle.get("artifacts", []):
@@ -142,6 +180,7 @@ async def import_bundle(
 
     return {
         "run_id": imported_run_id,
+        "scope_id": scope_id,
         "turns_imported": imported_turns,
         "artifacts_imported": imported_artifacts,
     }

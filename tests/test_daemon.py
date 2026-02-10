@@ -2,7 +2,7 @@
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -12,11 +12,13 @@ from universal_context.daemon.watcher import Watcher
 from universal_context.daemon.worker import Worker
 from universal_context.db.client import UCDatabase
 from universal_context.db.queries import (
+    backfill_canonical_ids,
     claim_next_job,
     create_job,
     create_run,
     create_scope,
     create_turn_with_artifact,
+    detect_merged_runs,
     get_run,
     list_jobs,
 )
@@ -219,3 +221,153 @@ class TestTurnSummarizer:
         summarizer = TurnSummarizer(max_chars=100)
         result = summarizer._extractive_summary("Short text")
         assert result == "Short text"
+
+
+# ============================================================
+# BACKFILL ON STARTUP
+# ============================================================
+
+
+class TestBackfillOnStartup:
+    async def test_backfill_canonical_ids_sets_id(self, db: UCDatabase):
+        """Scopes without canonical_id should get one after backfill."""
+        scope = await create_scope(db, "proj", "/tmp/proj")
+        scope_id = str(scope["id"])
+
+        # Verify it starts without canonical_id
+        assert scope.get("canonical_id") is None
+
+        with patch(
+            "universal_context.git.resolve_canonical_id",
+            return_value="github.com/user/proj",
+        ):
+            count = await backfill_canonical_ids(db)
+
+        assert count == 1
+
+        # Verify it was set
+        from universal_context.db.queries import get_scope
+        updated = await get_scope(db, scope_id)
+        assert updated["canonical_id"] == "github.com/user/proj"
+
+    async def test_backfill_skips_existing(self, db: UCDatabase):
+        """Scopes with canonical_id should be skipped."""
+        await create_scope(db, "proj", "/tmp/proj", canonical_id="github.com/user/proj")
+
+        with patch(
+            "universal_context.git.resolve_canonical_id",
+            return_value="github.com/user/proj",
+        ):
+            count = await backfill_canonical_ids(db)
+
+        assert count == 0
+
+    async def test_backfill_merges_duplicates(self, db: UCDatabase):
+        """Two scopes resolving to same canonical_id should merge."""
+        await create_scope(db, "proj1", "/tmp/proj1", canonical_id="github.com/user/repo")
+        s2 = await create_scope(db, "proj2", "/tmp/proj2")  # no canonical_id
+
+        with patch(
+            "universal_context.git.resolve_canonical_id",
+            return_value="github.com/user/repo",
+        ):
+            count = await backfill_canonical_ids(db)
+
+        assert count == 1  # s2 merged into s1
+
+        from universal_context.db.queries import get_scope
+        # s2 should be gone (merged)
+        deleted = await get_scope(db, str(s2["id"]))
+        assert deleted is None
+
+
+# ============================================================
+# MERGE DETECTION
+# ============================================================
+
+
+class TestMergeDetection:
+    async def test_detect_merged_runs(self, db: UCDatabase):
+        """Runs from branches merged into main should get tagged."""
+        scope = await create_scope(db, "proj", "/tmp/proj")
+        scope_id = str(scope["id"])
+
+        # Create a run on feature branch
+        run = await create_run(
+            db, scope_id, "claude", branch="feature/auth", commit_sha="abc1234",
+        )
+        run_id = str(run["id"])
+
+        # Create a run on main (current)
+        await create_run(db, scope_id, "claude", branch="main", commit_sha="def5678")
+
+        with patch(
+            "universal_context.git.is_ancestor",
+            return_value=True,
+        ):
+            count = await detect_merged_runs(
+                db, scope_id, "main", Path("/tmp/proj"),
+            )
+
+        assert count == 1
+
+        # Verify merged_to was set
+        updated = await get_run(db, run_id)
+        assert updated["merged_to"] == "main"
+
+    async def test_detect_no_merged_runs(self, db: UCDatabase):
+        """Unmerged feature branch runs should not be tagged."""
+        scope = await create_scope(db, "proj", "/tmp/proj")
+        scope_id = str(scope["id"])
+
+        await create_run(
+            db, scope_id, "claude", branch="feature/wip", commit_sha="abc1234",
+        )
+
+        with patch(
+            "universal_context.git.is_ancestor",
+            return_value=False,
+        ):
+            count = await detect_merged_runs(
+                db, scope_id, "main", Path("/tmp/proj"),
+            )
+
+        assert count == 0
+
+    async def test_detect_skips_same_branch(self, db: UCDatabase):
+        """Runs already on main should not be checked."""
+        scope = await create_scope(db, "proj", "/tmp/proj")
+        scope_id = str(scope["id"])
+
+        await create_run(db, scope_id, "claude", branch="main", commit_sha="abc1234")
+
+        with patch(
+            "universal_context.git.is_ancestor",
+        ) as mock_ancestor:
+            count = await detect_merged_runs(
+                db, scope_id, "main", Path("/tmp/proj"),
+            )
+
+        assert count == 0
+        mock_ancestor.assert_not_called()
+
+    async def test_detect_skips_already_tagged(self, db: UCDatabase):
+        """Runs already tagged with merged_to should be skipped."""
+        scope = await create_scope(db, "proj", "/tmp/proj")
+        scope_id = str(scope["id"])
+
+        run = await create_run(
+            db, scope_id, "claude", branch="feature/old", commit_sha="abc1234",
+        )
+        # Manually tag it
+        await db.query(f"UPDATE {str(run['id'])} SET merged_to = 'main'")
+
+        with patch(
+            "universal_context.git.is_ancestor",
+        ) as mock_ancestor:
+            count = await detect_merged_runs(
+                db, scope_id, "main", Path("/tmp/proj"),
+            )
+
+        assert count == 0
+        mock_ancestor.assert_not_called()

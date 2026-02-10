@@ -98,6 +98,13 @@ class UCDaemon:
         # Recover from crashes
         await self._watcher.recover_interrupted_runs()
 
+        # Backfill canonical_id on scopes that predate git-aware identity
+        from ..db.queries import backfill_canonical_ids
+
+        backfilled = await backfill_canonical_ids(self._db)
+        if backfilled:
+            logger.info("Backfilled canonical_id on %d scope(s)", backfilled)
+
         # Run both as concurrent tasks
         logger.info("UC Daemon starting...")
         async with asyncio.TaskGroup() as tg:

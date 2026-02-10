@@ -155,6 +155,19 @@ class Watcher:
             run_id,
         )
 
+        # Detect runs from other branches that have been merged into current branch
+        if branch and project_path:
+            from ..db.queries import detect_merged_runs
+
+            try:
+                merged = await detect_merged_runs(
+                    self._db, scope_id, branch, project_path,
+                )
+                if merged:
+                    logger.info("Detected %d merged run(s) into %s", merged, branch)
+            except Exception as e:
+                logger.debug("Merge detection failed: %s", e)
+
         # Ingest any existing turns
         await self._check_new_turns(state, adapter)
 

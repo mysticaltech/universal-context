@@ -52,6 +52,15 @@ The `--context` flag uses embedding-based retrieval. Be specific — the more de
 
 Returns `semantic_results` (ranked by cosine similarity) and `runs` (recent sessions with turn summaries).
 
+### Branch-filtered context
+
+```bash
+uc context --project . --branch main --json         # only runs from main branch
+uc context --project . --branch feature/auth --json # only runs from a feature branch
+```
+
+Runs now carry `branch`, `commit_sha`, and `merged_to` (set when a feature branch's commits are ancestors of the current branch). Branch filtering is useful when you want context from a specific line of work.
+
 ### Keyword search — find exact terms
 
 ```bash
@@ -135,11 +144,17 @@ uc memory install-hook                           # Auto-inject on session start
 uc context --json --context "task description"   # Semantic retrieval
 uc context --json --query "keyword"              # Keyword search (BM25)
 uc context --json --context "..." --query "..."  # Hybrid (both combined)
+uc context --project . --branch main --json      # Branch-filtered context
 uc search "query" --project .                    # Scoped artifact search
 uc search "query" --project . --kind summary     # Filter by kind
 
 # Inspect
 uc inspect --json "turn:id"                      # Turn details + provenance
 uc timeline --json                               # Latest run timeline
+uc timeline --branch main --json                 # Timeline filtered by branch
 uc status --json                                 # System overview
+
+# Sharing
+uc share export run:abc -o bundle.json           # Export run as v2 bundle
+uc share import bundle.json --project .          # Import, matching scope by canonical_id
 ```

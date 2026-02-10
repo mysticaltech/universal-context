@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,6 +11,7 @@ from universal_context.git import (
     get_current_branch,
     get_head_sha,
     get_merge_base,
+    is_ancestor,
     resolve_canonical_id,
 )
 
@@ -231,6 +233,46 @@ class TestGetMergeBase:
     def test_no_common_ancestor_returns_none(self, tmp_path):
         with patch("universal_context.git._run_git", return_value=None):
             assert get_merge_base(tmp_path, "orphan", "main") is None
+
+
+# ============================================================
+# IS ANCESTOR
+# ============================================================
+
+
+class TestIsAncestor:
+    def test_ancestor_returns_true(self, tmp_path):
+        """When commit is an ancestor, returns True."""
+        with patch("universal_context.git.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            assert is_ancestor(tmp_path, "abc1234", "main") is True
+
+    def test_not_ancestor_returns_false(self, tmp_path):
+        """When commit is not an ancestor, returns False."""
+        with patch("universal_context.git.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 1
+            assert is_ancestor(tmp_path, "abc1234", "main") is False
+
+    def test_timeout_returns_false(self, tmp_path):
+        """Timeout should not raise, returns False."""
+        with patch("universal_context.git.subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired(cmd="git", timeout=5)
+            assert is_ancestor(tmp_path, "abc1234", "main") is False
+
+    def test_file_not_found_returns_false(self, tmp_path):
+        """Missing git binary returns False."""
+        with patch("universal_context.git.subprocess.run") as mock_run:
+            mock_run.side_effect = FileNotFoundError()
+            assert is_ancestor(tmp_path, "abc1234", "main") is False
+
+    def test_calls_correct_command(self, tmp_path):
+        """Verify the correct git command is called."""
+        with patch("universal_context.git.subprocess.run") as mock_run:
+            mock_run.return_value.returncode = 0
+            is_ancestor(tmp_path, "deadbeef", "feature/x")
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0][0]
+            assert args == ["git", "merge-base", "--is-ancestor", "deadbeef", "feature/x"]
 
 
 # ============================================================

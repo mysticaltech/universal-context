@@ -18,8 +18,10 @@ uc status
 uc search "query" --project .
 uc ask "question" --project .
 uc context --json --context "task description"
+uc context --project . --branch main --json
 uc rebuild-index
 uc timeline
+uc timeline --branch main
 uc inspect turn:abc123
 uc daemon start -f
 uc dashboard
@@ -28,6 +30,10 @@ uc dashboard
 uc memory show --project .
 uc memory refresh --project .
 uc memory inject --project .
+
+# Sharing
+uc share export run:abc123 -o bundle.json
+uc share import bundle.json --project .
 
 # Test & lint
 pytest
@@ -42,7 +48,10 @@ ruff format .
 - **SurrealDB graph DB**: `file://` embedded or `ws://` server, graph edges for provenance
 - **Adapter/Trigger pattern**: pluggable per-runtime session detection (Claude, Codex, Gemini)
 - **Summaries are artifacts**: derived, immutable, linked via `depends_on` provenance edges
-- **Git-aware scopes**: canonical_id from git remote URL → worktrees/clones share one scope, branch + commit_sha on runs
+- **Git-aware scopes**: canonical_id from git remote URL → worktrees/clones share one scope, branch + commit_sha + merged_to on runs
+- **Automatic scope backfill**: daemon startup backfills canonical_id on legacy scopes, merging duplicates
+- **Merge detection**: watcher detects when feature branch commits are ancestors of current branch via `git merge-base --is-ancestor`
+- **Cross-machine sharing**: v2 bundles carry scope metadata; import matches by canonical_id or explicit `--project`
 - **Scope-filtered search**: denormalized `scope` field on artifacts for O(1) scope filtering
 - **Self-healing vector search**: HNSW KNN with automatic brute-force cosine fallback
 
@@ -53,7 +62,7 @@ universal_context/
 ├── cli.py                  # Typer CLI (search, ask, context, timeline, inspect, daemon, memory)
 ├── config.py               # UCConfig dataclass, YAML load/save
 ├── embed.py                # EmbedProvider ABC + Local (EmbeddingGemma/ONNX) + OpenAI
-├── git.py                  # Git-aware scope identity (canonical_id, branch, commit_sha)
+├── git.py                  # Git-aware scope identity (canonical_id, branch, commit_sha, is_ancestor)
 ├── llm.py                  # LLM provider factory (Claude, OpenAI, OpenRouter)
 ├── redact.py               # Secret redaction (API keys, tokens, passwords)
 ├── db/
@@ -69,17 +78,17 @@ universal_context/
 │       └── memory.py       # WorkingMemoryProcessor (LLM distillation)
 ├── adapters/               # Session discovery: claude.py, codex.py, gemini.py
 ├── triggers/               # Turn detection: claude_trigger, codex_trigger, gemini_trigger
-├── sharing/                # Export/import bundles + checkpoints
+├── sharing/                # Export/import v2 bundles (scope-aware) + checkpoints
 ├── tui/                    # Textual dashboard (Overview, Timeline, Search tabs)
 └── models/types.py         # Pydantic domain models + StrEnum types
 
-tests/                      # 265 tests
-├── test_git.py             # Git URL normalization, canonical_id, branch, cross-worktree
+tests/                      # 283 tests
+├── test_git.py             # Git URL normalization, canonical_id, branch, cross-worktree, is_ancestor
 ├── test_db.py              # Schema, queries, search
 ├── test_search.py          # Scope filtering, embedded fallbacks, RRF
 ├── test_embed.py           # Embedding providers + vector search
 ├── test_adapters.py        # Adapters + triggers
-├── test_daemon.py          # Watcher, worker, summarizer
+├── test_daemon.py          # Watcher, worker, summarizer, backfill, merge detection
 ├── test_cli_json.py        # CLI --json output
 ├── test_e2e.py             # Full pipeline integration
 └── ...                     # models, config, sharing, redact, llm, memory
@@ -108,6 +117,10 @@ tests/                      # 265 tests
 10. **D10**: Embedded search fallbacks — substring match for text, brute-force cosine for vector, Python RRF merge for hybrid
 11. **D11**: HNSW self-healing — `semantic_search()` tries KNN first, falls back to brute-force cosine if index is stale; worker auto-rebuilds HNSW after every 25 new embeddings
 12. **D12**: Git-aware scope identity — canonical_id = normalized git remote URL > git-common-dir > path://. Worktrees and clones of the same repo share one scope. Branch + commit_sha captured on each run for provenance
+13. **D13**: Automatic backfill — daemon startup runs `backfill_canonical_ids()` to migrate legacy scopes, merging duplicates
+14. **D14**: Merge detection — watcher tags runs from feature branches whose commits are ancestors of the current branch (`merged_to` field)
+15. **D15**: v2 share bundles — carry scope metadata (name, path, canonical_id) for cross-machine scope matching on import
+16. **D16**: SurrealDB v2 embedded NONE quirk — `WHERE field = NONE` doesn't match; use `WHERE !field` for falsy checks on option fields
 
 ## SurrealDB Notes
 

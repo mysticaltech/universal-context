@@ -108,6 +108,24 @@ def get_merge_base(path: Path, branch: str, target: str = "main") -> str | None:
     return _run_git(["merge-base", branch, target], cwd=path.resolve())
 
 
+def is_ancestor(path: Path, commit: str, branch: str) -> bool:
+    """Check if commit is an ancestor of branch (merged into it).
+
+    Uses git merge-base --is-ancestor, which communicates via exit code
+    only (no stdout), so this is separate from _run_git().
+    """
+    try:
+        result = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", commit, branch],
+            cwd=path.resolve(),
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
 def _run_git(args: list[str], cwd: Path) -> str | None:
     """Run a git command and return stripped stdout, or None on failure."""
     try:
