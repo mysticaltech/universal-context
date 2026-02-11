@@ -165,5 +165,11 @@ async def apply_schema(db: UCDatabase, embedding_dim: int = 768) -> None:
     if db.is_server:
         for statement in SERVER_STATEMENTS:
             await db.query(statement)
-        await db.query(_HNSW_TEMPLATE.format(dim=embedding_dim))
+        try:
+            await db.query(_HNSW_TEMPLATE.format(dim=embedding_dim))
+        except RuntimeError:
+            # HNSW index creation can fail on SurrealDB v3 beta (corrupted
+            # index data, missing files, etc.).  Search falls back to
+            # brute-force cosine automatically, so this is non-fatal.
+            pass
     await db.query(META_STATEMENT)

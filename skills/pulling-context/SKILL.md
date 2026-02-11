@@ -25,6 +25,20 @@ This gathers working memory + scope-filtered search results, sends them to an LL
 
 Falls back to displaying raw search results if no LLM is configured.
 
+## Deep reasoning: agentic exploration
+
+For complex questions that need multi-hop reasoning across sessions:
+
+```bash
+uc reason "How did the auth system evolve?" --project .
+uc reason "What led to choosing SurrealDB?" --project . --verbose
+uc reason "Trace the scope implementation" --project . --json
+```
+
+This uses DSPy's RLM (Recursive Language Model) — the LLM writes Python in a REPL loop to explore the graph database, calling tools like `get_working_memory()`, `search_sessions()`, `search_semantic()`, `list_recent_runs()`, `get_run_turns()`, and `query_graph()`. Much more thorough than `uc ask` for questions requiring multi-step exploration.
+
+Requires: `pip install universal-context[reason]` (installs DSPy).
+
 ## Working memory
 
 Working memory is an LLM-distilled summary of the project's recent sessions. It may already be in your system context as a `# Project Memory:` block — use it as your baseline.
@@ -133,6 +147,9 @@ uc memory inject --project .     # writes to AGENTS.md
 # Questions
 uc ask "question" --project .                    # LLM-powered Q&A (best for specific questions)
 uc ask "question" --project . --json             # JSON output
+uc reason "question" --project .                 # Agentic multi-hop reasoning (DSPy RLM)
+uc reason "question" --project . --verbose       # Show REPL trajectory
+uc reason "question" --project . --json          # JSON output with trajectory
 
 # Working memory
 uc memory show --project .                       # View distilled project context

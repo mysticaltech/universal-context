@@ -740,6 +740,91 @@ def ask(
     _run_async(_ask())
 
 
+@app.command()
+def reason(
+    question: str = typer.Argument(..., help="Question to explore via agentic reasoning"),
+    project: Path | None = typer.Option(
+        None, "--project", "-p", help="Project path (default: cwd)"
+    ),
+    max_iterations: int = typer.Option(12, "--max-iterations", help="Max REPL iterations"),
+    max_llm_calls: int = typer.Option(30, "--max-llm-calls", help="Max LLM calls"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show step-by-step trajectory"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Agentic reasoning — LLM explores project history via a REPL loop.
+
+    Uses DSPy's RLM module to let the LLM programmatically search,
+    navigate, and query UC's graph database. More thorough than `uc ask`
+    but slower and more expensive.
+
+    Requires: pip install universal-context[reason]
+    """
+
+    async def _reason():
+        try:
+            import dspy  # noqa: F401
+        except ImportError:
+            console.print(
+                "[red]DSPy is not installed.[/red]\n"
+                "Install it with: [cyan]pip install universal-context[reason][/cyan]\n"
+                "Or: [cyan]pip install dspy>=2.6[/cyan]"
+            )
+            raise typer.Exit(code=1)
+
+        from .config import UCConfig
+        from .reason import reason as run_reason
+
+        project_path = str((project or Path(".")).resolve())
+        config = UCConfig.load()
+
+        if not json_output:
+            console.print("[dim]Reasoning... (this may take a moment)[/dim]")
+
+        result = await run_reason(
+            question=question,
+            project_path=project_path,
+            config=config,
+            max_iterations=max_iterations,
+            max_llm_calls=max_llm_calls,
+            verbose=verbose,
+        )
+
+        if json_output:
+            print(json_mod.dumps(result, default=str))
+            return
+
+        from rich.markdown import Markdown
+        from rich.panel import Panel
+
+        console.print(Panel(
+            Markdown(result["answer"]),
+            title="Answer",
+            border_style="green",
+        ))
+
+        if verbose and result.get("trajectory"):
+            console.print("\n[bold]Trajectory:[/bold]")
+            for i, step in enumerate(result["trajectory"], 1):
+                if isinstance(step, dict):
+                    code = step.get("code", "")
+                    output = step.get("output", "")
+                    console.print(f"\n[cyan]Step {i}:[/cyan]")
+                    if code:
+                        from rich.syntax import Syntax
+                        console.print(Syntax(str(code), "python", theme="monokai"))
+                    if output:
+                        console.print(f"[dim]{str(output)[:500]}[/dim]")
+                else:
+                    console.print(f"\n[cyan]Step {i}:[/cyan] {str(step)[:500]}")
+
+        scope_info = f"scope: {result.get('scope', 'none')}"
+        iterations = result.get("iterations")
+        iter_info = f"  iterations: {iterations}" if iterations else ""
+        console.print(f"\n[dim]{scope_info}{iter_info}[/dim]")
+
+    _run_async(_reason())
+
+
 @app.command("rebuild-index")
 def rebuild_index(
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),

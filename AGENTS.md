@@ -2,13 +2,13 @@
 
 ## What This Is
 
-Operational memory engine for AI agents. Captures sessions from Claude Code, Codex CLI, and Gemini CLI into a SurrealDB graph database with full provenance. Supports BM25, semantic vector search, hybrid search, working memory distillation, and LLM-powered Q&A.
+Operational memory engine for AI agents. Captures sessions from Claude Code, Codex CLI, and Gemini CLI into a SurrealDB graph database with full provenance. Supports BM25, semantic vector search, hybrid search, working memory distillation, LLM-powered Q&A, and agentic multi-hop reasoning via DSPy RLM.
 
 ## Quick Reference
 
 ```bash
 # Dev install
-uv pip install -e ".[dev,llm]"
+uv pip install -e ".[dev,llm,reason]"
 
 # CLI
 uc --help
@@ -17,6 +17,8 @@ uc doctor
 uc status
 uc search "query" --project .
 uc ask "question" --project .
+uc reason "question" --project .
+uc reason "question" --project . --verbose
 uc context --json --context "task description"
 uc context --project . --branch main --json
 uc rebuild-index
@@ -59,11 +61,12 @@ ruff format .
 
 ```
 universal_context/
-├── cli.py                  # Typer CLI (search, ask, context, timeline, inspect, daemon, memory)
+├── cli.py                  # Typer CLI (search, ask, reason, context, timeline, inspect, daemon, memory)
 ├── config.py               # UCConfig dataclass, YAML load/save
 ├── embed.py                # EmbedProvider ABC + Local (EmbeddingGemma/ONNX) + OpenAI
 ├── git.py                  # Git-aware scope identity (canonical_id, branch, commit_sha, is_ancestor)
 ├── llm.py                  # LLM provider factory (Claude, OpenAI, OpenRouter)
+├── reason.py               # DSPy RLM integration (agentic reasoning over session history)
 ├── redact.py               # Secret redaction (API keys, tokens, passwords)
 ├── db/
 │   ├── client.py           # UCDatabase (async, embedded + server)
@@ -82,8 +85,9 @@ universal_context/
 ├── tui/                    # Textual dashboard (Overview, Timeline, Search tabs)
 └── models/types.py         # Pydantic domain models + StrEnum types
 
-tests/                      # 283 tests
+tests/                      # 341 tests
 ├── test_git.py             # Git URL normalization, canonical_id, branch, cross-worktree, is_ancestor
+├── test_reason.py          # RLM integration: AsyncBridge, LocalInterpreter, tools, LM config
 ├── test_db.py              # Schema, queries, search
 ├── test_search.py          # Scope filtering, embedded fallbacks, RRF
 ├── test_embed.py           # Embedding providers + vector search
@@ -121,6 +125,8 @@ tests/                      # 283 tests
 14. **D14**: Merge detection — watcher tags runs from feature branches whose commits are ancestors of the current branch (`merged_to` field)
 15. **D15**: v2 share bundles — carry scope metadata (name, path, canonical_id) for cross-machine scope matching on import
 16. **D16**: SurrealDB v2 embedded NONE quirk — `WHERE field = NONE` doesn't match; use `WHERE !field` for falsy checks on option fields
+17. **D17**: DSPy RLM for agentic reasoning — LLM writes Python in a REPL loop to explore the graph database. Optional dependency (`pip install .[reason]`). LocalInterpreter (in-process, no Deno/WASM), AsyncBridge wraps main event loop, tools submit coroutines via `run_coroutine_threadsafe()`
+18. **D18**: HNSW schema resilience — `apply_schema()` catches HNSW index creation failures gracefully (SurrealDB v3 beta corruption). Search self-heals via brute-force cosine fallback
 
 ## SurrealDB Notes
 
@@ -142,7 +148,8 @@ tests/                      # 283 tests
 
 - **Build-once bug**: data inserted after `DEFINE INDEX ... HNSW` is invisible to KNN.
 - **Workaround**: `REMOVE INDEX` + `DEFINE INDEX` forces rebuild. `REBUILD INDEX` is broken.
-- **Mitigations**: `semantic_search()` auto-falls back to brute-force cosine when HNSW returns 0 results. Worker auto-rebuilds HNSW after 25 new embeddings. `uc rebuild-index` available for manual rebuild.
+- **Mitigations**: `apply_schema()` catches HNSW creation failures (non-fatal). `semantic_search()` auto-falls back to brute-force cosine when HNSW returns 0 results. Worker auto-rebuilds HNSW after 25 new embeddings. `uc rebuild-index` available for manual rebuild.
+- **Data corruption**: HNSW index files can go missing on disk (`IO error: No such file or directory`). `REMOVE INDEX` succeeds but `DEFINE INDEX` fails until server restart with fresh data path. Tracked upstream.
 
 ### Schema Split
 

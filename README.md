@@ -8,7 +8,7 @@ Operational memory for AI coding agents. Captures every session, distills workin
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.13+](https://img.shields.io/badge/Python-3.13+-3776AB.svg?logo=python&logoColor=white)](https://python.org)
-[![Tests](https://img.shields.io/badge/Tests-283%20passing-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/Tests-341%20passing-brightgreen.svg)]()
 [![SurrealDB](https://img.shields.io/badge/SurrealDB-v3-6600FF.svg?logo=surrealdb&logoColor=white)](https://surrealdb.com)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa.svg)](https://github.com/sponsors/mysticaltech)
 
@@ -43,7 +43,7 @@ AI coding agents are stateless. Every session starts from zero. That architectur
 
 ## The Solution
 
-Universal Context runs a background daemon that watches your AI coding sessions, captures every turn into a SurrealDB graph database with full provenance, summarizes them via LLM, generates local embeddings, and distills working memory per project. Your agents get searchable, scoped context — keyword, semantic, or hybrid — plus LLM-powered Q&A across your entire history.
+Universal Context runs a background daemon that watches your AI coding sessions, captures every turn into a SurrealDB graph database with full provenance, summarizes them via LLM, generates local embeddings, and distills working memory per project. Your agents get searchable, scoped context — keyword, semantic, or hybrid — plus LLM-powered Q&A and agentic multi-hop reasoning across your entire history.
 
 **Local-first.** Your data stays on your machine. No cloud, no telemetry, no third-party storage.
 
@@ -98,6 +98,7 @@ Universal Context runs a background daemon that watches your AI coding sessions,
 
 ### Context & Q&A
 - **Natural language Q&A** — "How does the auth middleware work?"
+- **Agentic reasoning** — DSPy RLM multi-hop exploration of your session history
 - **Context retrieval** — relevant sessions for a task description
 - **JSON output** — every command supports `--json`
 
@@ -262,6 +263,8 @@ uc search "query" --project .              # Scoped to current project
 uc context --json --context "task desc"    # Get relevant context for a task
 uc context --project . --branch main       # Branch-filtered context
 uc ask "question" --project .              # LLM-powered Q&A
+uc reason "question" --project .          # Agentic multi-hop reasoning (DSPy RLM)
+uc reason "question" --project . -v       # Show REPL trajectory
 ```
 
 </details>
@@ -379,7 +382,7 @@ Every PR must pass **triple verification**:
 
 | Check | Command |
 |-------|---------|
-| Tests pass | `pytest -x -v` (283+ tests) |
+| Tests pass | `pytest -x -v` (341+ tests) |
 | Lint clean | `ruff check . && ruff format --check .` |
 | Manual test | Verify your change works end-to-end |
 
