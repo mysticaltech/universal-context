@@ -66,7 +66,8 @@ async def find_scope_by_path(db: UCDatabase, path: str) -> dict[str, Any] | None
 
 
 async def find_scope_by_canonical_id(
-    db: UCDatabase, canonical_id: str,
+    db: UCDatabase,
+    canonical_id: str,
 ) -> dict[str, Any] | None:
     """Find a scope by its canonical identity (git remote, git-local://, or path://)."""
     result = await db.query(
@@ -77,7 +78,9 @@ async def find_scope_by_canonical_id(
 
 
 async def find_scope_by_name(
-    db: UCDatabase, name: str, limit: int = 10,
+    db: UCDatabase,
+    name: str,
+    limit: int = 10,
 ) -> list[dict[str, Any]]:
     """Find scopes by name substring (case-insensitive)."""
     return await db.query(
@@ -108,9 +111,7 @@ async def update_scope(
         params["canonical_id"] = canonical_id
     if not sets:
         return await get_scope(db, scope_id)
-    result = await db.query(
-        f"UPDATE {scope_id} SET {', '.join(sets)}", params
-    )
+    result = await db.query(f"UPDATE {scope_id} SET {', '.join(sets)}", params)
     return result[0] if result else None
 
 
@@ -129,11 +130,9 @@ async def delete_scope(db: UCDatabase, scope_id: str) -> None:
             tid = str(turn["id"])
             # Delete artifacts produced by this turn (and their edges)
             await db.query(f"DELETE FROM produced WHERE in = {tid}")
-            artifacts = await db.query(
-                f"SELECT ->produced->artifact AS aids FROM {tid}"
-            )
+            artifacts = await db.query(f"SELECT ->produced->artifact AS aids FROM {tid}")
             for a in artifacts:
-                for aid in (a.get("aids") or []):
+                for aid in a.get("aids") or []:
                     aid_str = str(aid)
                     await db.query(
                         f"DELETE FROM depends_on WHERE in = {aid_str} OR out = {aid_str}"
@@ -155,17 +154,15 @@ async def delete_scope(db: UCDatabase, scope_id: str) -> None:
 
 
 async def merge_scopes(
-    db: UCDatabase, source_id: str, target_id: str,
+    db: UCDatabase,
+    source_id: str,
+    target_id: str,
 ) -> None:
     """Move all runs and artifacts from source scope into target, then delete source."""
     # Re-point runs
-    await db.query(
-        f"UPDATE run SET scope = {target_id} WHERE scope = {source_id}"
-    )
+    await db.query(f"UPDATE run SET scope = {target_id} WHERE scope = {source_id}")
     # Re-point artifacts
-    await db.query(
-        f"UPDATE artifact SET scope = {target_id} WHERE scope = {source_id}"
-    )
+    await db.query(f"UPDATE artifact SET scope = {target_id} WHERE scope = {source_id}")
     # Re-point working memory metadata references
     await db.query(
         "UPDATE artifact SET metadata.scope_id = $tid "
@@ -190,9 +187,7 @@ async def list_scopes_with_stats(db: UCDatabase) -> list[dict[str, Any]]:
     for s in scopes:
         sid = str(s["id"])
         # Count runs
-        run_count_result = await db.query(
-            f"SELECT count() FROM run WHERE scope = {sid} GROUP ALL"
-        )
+        run_count_result = await db.query(f"SELECT count() FROM run WHERE scope = {sid} GROUP ALL")
         run_count = run_count_result[0].get("count", 0) if run_count_result else 0
 
         # Count turns across all runs
@@ -211,17 +206,17 @@ async def list_scopes_with_stats(db: UCDatabase) -> list[dict[str, Any]]:
         agents = await db.query(
             f"SELECT agent_type, count() FROM run WHERE scope = {sid} GROUP BY agent_type"
         )
-        agent_breakdown = {
-            a["agent_type"]: a["count"] for a in agents
-        } if agents else {}
+        agent_breakdown = {a["agent_type"]: a["count"] for a in agents} if agents else {}
 
-        results.append({
-            **s,
-            "run_count": run_count,
-            "turn_count": turn_count,
-            "last_activity": last_activity,
-            "agent_breakdown": agent_breakdown,
-        })
+        results.append(
+            {
+                **s,
+                "run_count": run_count,
+                "turn_count": turn_count,
+                "last_activity": last_activity,
+                "agent_breakdown": agent_breakdown,
+            }
+        )
     return results
 
 
@@ -246,7 +241,7 @@ async def create_run(
     if commit_sha:
         extras += ", commit_sha = $commit_sha"
     result = await db.query(
-        f'CREATE run:{rid} SET scope = {scope_id}, agent_type = $agent_type, '
+        f"CREATE run:{rid} SET scope = {scope_id}, agent_type = $agent_type, "
         f'status = "active", session_path = $session_path{extras}',
         {
             "agent_type": agent_type,
@@ -333,10 +328,9 @@ async def create_turn_with_artifact(
 
     # Build the transaction
     stmts = [
-        f'CREATE turn:{tid} SET run = {run_id}, sequence = $sequence, '
-        f'user_message = $user_message',
+        f"CREATE turn:{tid} SET run = {run_id}, sequence = $sequence, user_message = $user_message",
         f'CREATE artifact:{aid} SET kind = "transcript", content = $raw_content, '
-        f'content_hash = $content_hash{scope_clause}',
+        f"content_hash = $content_hash{scope_clause}",
         f"RELATE {run_id}->contains->turn:{tid} SET sequence = $sequence",
         f"RELATE turn:{tid}->produced->artifact:{aid}",
     ]
@@ -349,12 +343,15 @@ async def create_turn_with_artifact(
         )
 
     txn = "BEGIN TRANSACTION;\n" + ";\n".join(stmts) + ";\nCOMMIT TRANSACTION"
-    await db.query(txn, {
-        "sequence": sequence,
-        "user_message": user_message,
-        "raw_content": raw_content,
-        "content_hash": content_hash,
-    })
+    await db.query(
+        txn,
+        {
+            "sequence": sequence,
+            "user_message": user_message,
+            "raw_content": raw_content,
+            "content_hash": content_hash,
+        },
+    )
 
     return {"turn_id": f"turn:{tid}", "artifact_id": f"artifact:{aid}"}
 
@@ -367,16 +364,12 @@ async def get_turn(db: UCDatabase, turn_id: str) -> dict[str, Any] | None:
 
 async def list_turns(db: UCDatabase, run_id: str) -> list[dict[str, Any]]:
     """List all turns in a run, ordered by sequence."""
-    return await db.query(
-        f"SELECT * FROM turn WHERE run = {run_id} ORDER BY sequence ASC"
-    )
+    return await db.query(f"SELECT * FROM turn WHERE run = {run_id} ORDER BY sequence ASC")
 
 
 async def count_turns(db: UCDatabase, run_id: str) -> int:
     """Count turns in a run."""
-    result = await db.query(
-        f"SELECT count() FROM turn WHERE run = {run_id} GROUP ALL"
-    )
+    result = await db.query(f"SELECT count() FROM turn WHERE run = {run_id} GROUP ALL")
     return result[0].get("count", 0) if result else 0
 
 
@@ -466,9 +459,7 @@ async def search_artifacts(
         conditions.insert(0, "content != NONE")
 
     where = " AND ".join(conditions)
-    result = await db.query(
-        f"SELECT * FROM artifact WHERE {where} LIMIT {limit}", params
-    )
+    result = await db.query(f"SELECT * FROM artifact WHERE {where} LIMIT {limit}", params)
     return result if isinstance(result, list) else []
 
 
@@ -477,9 +468,7 @@ async def search_artifacts(
 # ============================================================
 
 
-async def store_embedding(
-    db: UCDatabase, artifact_id: str, embedding: list[float]
-) -> None:
+async def store_embedding(db: UCDatabase, artifact_id: str, embedding: list[float]) -> None:
     """Store an embedding vector on an artifact record."""
     await db.query(
         f"UPDATE {artifact_id} SET embedding = $embedding",
@@ -569,10 +558,18 @@ async def hybrid_search(
 
     # Embedded fallback: run both searches, merge via Python RRF
     text_results = await search_artifacts(
-        db, query_text, kind=kind, limit=limit, scope_id=scope_id,
+        db,
+        query_text,
+        kind=kind,
+        limit=limit,
+        scope_id=scope_id,
     )
     vector_results = await semantic_search(
-        db, query_embedding, kind=kind, limit=limit, scope_id=scope_id,
+        db,
+        query_embedding,
+        kind=kind,
+        limit=limit,
+        scope_id=scope_id,
     )
     return _merge_rrf(text_results, vector_results, limit=limit)
 
@@ -619,29 +616,22 @@ async def get_provenance_chain(db: UCDatabase, artifact_id: str) -> list[dict[st
 
 async def get_artifact_lineage(db: UCDatabase, artifact_id: str) -> list[dict[str, Any]]:
     """Get all artifacts this one depends on."""
-    return await db.query(
-        f"SELECT ->depends_on->artifact FROM {artifact_id}"
-    )
+    return await db.query(f"SELECT ->depends_on->artifact FROM {artifact_id}")
 
 
 async def get_turn_artifacts(db: UCDatabase, turn_id: str) -> list[dict[str, Any]]:
     """Get all artifacts produced by a turn."""
-    return await db.query(
-        f"SELECT ->produced->artifact FROM {turn_id}"
-    )
+    return await db.query(f"SELECT ->produced->artifact FROM {turn_id}")
 
 
-async def get_turn_summaries(
-    db: UCDatabase, run_id: str, limit: int = 10
-) -> list[dict[str, Any]]:
+async def get_turn_summaries(db: UCDatabase, run_id: str, limit: int = 10) -> list[dict[str, Any]]:
     """Get turns for a run with their summary artifacts.
 
     For each turn, traverses turn->produced->artifact to find kind='summary'
     artifacts. Returns list of {turn_id, sequence, user_message, summary, started_at}.
     """
     turns = await db.query(
-        f"SELECT * FROM turn WHERE run = {run_id}"
-        f" ORDER BY sequence DESC LIMIT {limit}"
+        f"SELECT * FROM turn WHERE run = {run_id} ORDER BY sequence DESC LIMIT {limit}"
     )
 
     results = []
@@ -657,18 +647,14 @@ async def get_turn_summaries(
                 for aid in produced.get("->artifact", []):
                     aid_str = str(aid)
                     # Reverse-traverse: find artifacts that depend on this one
-                    rev = await db.query(
-                        f"SELECT <-depends_on<-artifact FROM {aid_str}"
-                    )
+                    rev = await db.query(f"SELECT <-depends_on<-artifact FROM {aid_str}")
                     for row in rev:
                         dep = row.get("<-depends_on", {})
                         if isinstance(dep, dict):
                             dep_ids = dep.get("<-artifact", [])
                             for did in dep_ids:
                                 did_str = str(did)
-                                detail = await db.query(
-                                    f"SELECT kind, content FROM {did_str}"
-                                )
+                                detail = await db.query(f"SELECT kind, content FROM {did_str}")
                                 if detail and detail[0].get("kind") == "summary":
                                     summary_text = detail[0].get("content", "")
                                     break
@@ -677,13 +663,15 @@ async def get_turn_summaries(
             if summary_text is not None:
                 break
 
-        results.append({
-            "turn_id": tid,
-            "sequence": t.get("sequence"),
-            "user_message": t.get("user_message"),
-            "summary": summary_text,
-            "started_at": t.get("started_at"),
-        })
+        results.append(
+            {
+                "turn_id": tid,
+                "sequence": t.get("sequence"),
+                "user_message": t.get("user_message"),
+                "summary": summary_text,
+                "started_at": t.get("started_at"),
+            }
+        )
 
     return results
 
@@ -712,28 +700,43 @@ async def create_job(
 async def claim_next_job(db: UCDatabase) -> dict[str, Any] | None:
     """Claim the next pending job (highest priority, oldest first).
 
-    Uses SELECT + UPDATE pattern since UPDATE doesn't support ORDER BY.
+    On server mode, uses a SurrealQL transaction to atomically SELECT +
+    UPDATE so concurrent workers cannot double-claim the same job.
+    On embedded mode (single-process, fcntl-locked), uses plain SELECT +
+    UPDATE since there's no concurrency risk and the v2 embedded engine
+    doesn't support LET/IF inside transactions.
     """
-    # Find the best candidate
+    if db.is_server:
+        result = await db.query(
+            "BEGIN TRANSACTION;"
+            ' LET $job = (SELECT * FROM job WHERE status = "pending"'
+            "  ORDER BY priority DESC, created_at ASC LIMIT 1);"
+            " IF $job THEN"
+            '   UPDATE $job[0].id SET status = "running", started_at = time::now();'
+            " END;"
+            " COMMIT TRANSACTION;"
+        )
+        for item in result:
+            if isinstance(item, dict) and item.get("status") == "running":
+                return item
+            if isinstance(item, list) and item:
+                for sub in item:
+                    if isinstance(sub, dict) and sub.get("status") == "running":
+                        return sub
+        return None
+
+    # Embedded fallback: plain SELECT + UPDATE (no concurrency risk)
     candidates = await db.query(
         'SELECT * FROM job WHERE status = "pending" ORDER BY priority DESC, created_at ASC LIMIT 1'
     )
     if not candidates:
         return None
-
-    job = candidates[0]
-    job_id = str(job["id"])
-
-    # Claim it
-    result = await db.query(
-        f'UPDATE {job_id} SET status = "running", started_at = time::now()'
-    )
+    job_id = str(candidates[0]["id"])
+    result = await db.query(f'UPDATE {job_id} SET status = "running", started_at = time::now()')
     return result[0] if result else None
 
 
-async def complete_job(
-    db: UCDatabase, job_id: str, result: dict[str, Any] | None = None
-) -> None:
+async def complete_job(db: UCDatabase, job_id: str, result: dict[str, Any] | None = None) -> None:
     """Mark a job as completed."""
     await db.query(
         f'UPDATE {job_id} SET status = "completed", completed_at = time::now(), result = $result',
@@ -793,7 +796,8 @@ async def count_jobs_by_status(db: UCDatabase) -> dict[str, int]:
 
 
 async def get_working_memory(
-    db: UCDatabase, scope_id: str,
+    db: UCDatabase,
+    scope_id: str,
 ) -> dict[str, Any] | None:
     """Get the most recent working memory artifact for a scope.
 
@@ -853,7 +857,9 @@ async def upsert_working_memory(
 
 
 async def get_working_memory_history(
-    db: UCDatabase, scope_id: str, limit: int = 10,
+    db: UCDatabase,
+    scope_id: str,
+    limit: int = 10,
 ) -> list[dict[str, Any]]:
     """Get version history of working memory artifacts for a scope."""
     return await db.query(
@@ -865,7 +871,10 @@ async def get_working_memory_history(
 
 
 async def get_scope_summaries_for_distillation(
-    db: UCDatabase, scope_id: str, limit: int = 30, branch: str | None = None,
+    db: UCDatabase,
+    scope_id: str,
+    limit: int = 30,
+    branch: str | None = None,
 ) -> list[dict[str, Any]]:
     """Get recent turn summaries across all runs in a scope.
 
@@ -889,14 +898,16 @@ async def get_scope_summaries_for_distillation(
         summaries = await get_turn_summaries(db, rid, limit=limit - len(results))
 
         for s in summaries:
-            results.append({
-                "run_id": rid,
-                "agent_type": agent_type,
-                "sequence": s.get("sequence"),
-                "user_message": s.get("user_message"),
-                "summary": s.get("summary"),
-                "started_at": s.get("started_at"),
-            })
+            results.append(
+                {
+                    "run_id": rid,
+                    "agent_type": agent_type,
+                    "sequence": s.get("sequence"),
+                    "user_message": s.get("user_message"),
+                    "summary": s.get("summary"),
+                    "started_at": s.get("started_at"),
+                }
+            )
 
     return results
 
@@ -928,18 +939,13 @@ async def backfill_artifact_scopes(db: UCDatabase, batch_size: int = 100) -> int
             continue
         oid = str(orphan["id"])
         # Walk: artifact <-produced<- turn.run.scope
-        chain = await db.query(
-            f"SELECT <-produced<-turn.run.scope AS scope_id FROM {oid}"
-        )
-        scope_ref = _extract_scope_from_traversal(
-            chain if isinstance(chain, list) else []
-        )
+        chain = await db.query(f"SELECT <-produced<-turn.run.scope AS scope_id FROM {oid}")
+        scope_ref = _extract_scope_from_traversal(chain if isinstance(chain, list) else [])
 
         # For derived artifacts, walk depends_on -> source -> produced -> turn
         if scope_ref is None:
             dep_chain = await db.query(
-                f"SELECT ->depends_on->artifact<-produced<-turn.run.scope "
-                f"AS scope_id FROM {oid}"
+                f"SELECT ->depends_on->artifact<-produced<-turn.run.scope AS scope_id FROM {oid}"
             )
             scope_ref = _extract_scope_from_traversal(
                 dep_chain if isinstance(dep_chain, list) else []
@@ -988,9 +994,7 @@ async def backfill_canonical_ids(db: UCDatabase) -> int:
     logger = logging.getLogger(__name__)
     count = 0
 
-    scopes = await db.query(
-        "SELECT * FROM scope WHERE !canonical_id"
-    )
+    scopes = await db.query("SELECT * FROM scope WHERE !canonical_id")
     if not isinstance(scopes, list):
         return 0
 
@@ -1012,7 +1016,9 @@ async def backfill_canonical_ids(db: UCDatabase) -> int:
             # Merge this scope into the existing one
             logger.info(
                 "Merging scope %s into %s (shared canonical_id: %s)",
-                scope_id, str(existing["id"]), canonical_id,
+                scope_id,
+                str(existing["id"]),
+                canonical_id,
             )
             await merge_scopes(db, scope_id, str(existing["id"]))
             count += 1
@@ -1057,7 +1063,10 @@ async def detect_merged_runs(
         if not commit:
             continue
         ancestor = await asyncio.to_thread(
-            is_ancestor, Path(str(repo_path)), commit, current_branch,
+            is_ancestor,
+            Path(str(repo_path)),
+            commit,
+            current_branch,
         )
         if ancestor:
             run_id = str(run["id"])

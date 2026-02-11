@@ -1,5 +1,8 @@
 """Tests for SurrealDB storage layer — client, schema, queries."""
 
+import asyncio
+from unittest.mock import patch
+
 import pytest
 
 from universal_context.db import queries
@@ -130,8 +133,11 @@ class TestTurnQueries:
     async def test_create_turn_with_artifact(self, db: UCDatabase):
         run_id = await self._setup_run(db)
         result = await queries.create_turn_with_artifact(
-            db, run_id, sequence=1, user_message="fix the bug",
-            raw_content="user: fix the bug\nassistant: I'll look into it"
+            db,
+            run_id,
+            sequence=1,
+            user_message="fix the bug",
+            raw_content="user: fix the bug\nassistant: I'll look into it",
         )
         assert "turn_id" in result
         assert "artifact_id" in result
@@ -139,8 +145,12 @@ class TestTurnQueries:
     async def test_turn_creates_job(self, db: UCDatabase):
         run_id = await self._setup_run(db)
         await queries.create_turn_with_artifact(
-            db, run_id, sequence=1, user_message="hello",
-            raw_content="test content", create_summary_job=True,
+            db,
+            run_id,
+            sequence=1,
+            user_message="hello",
+            raw_content="test content",
+            create_summary_job=True,
         )
         jobs = await queries.list_jobs(db, status="pending")
         assert len(jobs) == 1
@@ -281,3 +291,69 @@ class TestJobQueue:
         await queries.create_job(db, "turn_summary", "turn:1", priority=10)
         claimed = await queries.claim_next_job(db)
         assert claimed["job_type"] == "turn_summary"  # Higher priority first
+
+    async def test_claim_next_job_no_double_claim(self, db: UCDatabase):
+        """Two sequential claims should each get a different job."""
+        await queries.create_job(db, "turn_summary", "turn:1")
+        await queries.create_job(db, "embedding", "artifact:1")
+
+        first = await queries.claim_next_job(db)
+        second = await queries.claim_next_job(db)
+
+        assert first is not None
+        assert second is not None
+        assert str(first["id"]) != str(second["id"])
+
+
+# ============================================================
+# QUERY RETRY & TIMEOUT
+# ============================================================
+
+
+class TestQueryRetry:
+    async def test_query_retries_on_transaction_conflict(self):
+        """query() should retry on transient 'Transaction conflict' errors."""
+        db = UCDatabase.in_memory()
+        await db.connect(timeout=0)
+        try:
+            # Patch the underlying SDK query to return conflict then success
+            original_query = db.db.query
+            call_count = 0
+
+            async def mock_query(surql, params=None):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    return "There was a problem with the database: Transaction conflict"
+                if params:
+                    return await original_query(surql, params)
+                return await original_query(surql)
+
+            with patch.object(db.db, "query", side_effect=mock_query):
+                result = await db.query("SELECT * FROM scope")
+                assert isinstance(result, list)
+                assert call_count == 2  # first call conflicted, second succeeded
+        finally:
+            await db.close()
+
+    async def test_query_raises_after_max_retries(self):
+        """query() should raise RuntimeError after exhausting retries."""
+        db = UCDatabase.in_memory()
+        await db.connect(timeout=0)
+        try:
+            conflict_msg = "Transaction conflict detected"
+
+            async def always_conflict(surql, params=None):
+                return conflict_msg
+
+            with patch.object(db.db, "query", side_effect=always_conflict):
+                with pytest.raises(RuntimeError, match="Transaction conflict"):
+                    await db.query("SELECT * FROM scope", _retries=3)
+        finally:
+            await db.close()
+
+    async def test_connect_timeout(self):
+        """connect() should raise TimeoutError on a hanging connection."""
+        db = UCDatabase.from_url("ws://192.0.2.1:9999")  # non-routable address
+        with pytest.raises((TimeoutError, asyncio.TimeoutError, OSError)):
+            await db.connect(timeout=0.5)

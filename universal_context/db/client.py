@@ -10,10 +10,14 @@ Supports two connection modes:
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
 from surrealdb import AsyncSurreal
+
+logger = logging.getLogger(__name__)
 
 
 class UCDatabase:
@@ -54,12 +58,26 @@ class UCDatabase:
         """True when connected to a SurrealDB server (vs embedded engine)."""
         return self._url.startswith(("ws://", "wss://", "http://", "https://"))
 
-    async def connect(self) -> None:
-        """Connect to the database and select namespace/database."""
+    async def connect(self, timeout: float = 10.0) -> None:
+        """Connect to the database and select namespace/database.
+
+        Args:
+            timeout: Max seconds to wait for connect and signin.
+                     Pass 0 to disable (used by tests with mem://).
+        """
         self._db = AsyncSurreal(self._url)
-        await self._db.connect()
+        if timeout > 0:
+            await asyncio.wait_for(self._db.connect(), timeout=timeout)
+        else:
+            await self._db.connect()
         if self.is_server and self._user:
-            await self._db.signin({"user": self._user, "pass": self._password})
+            if timeout > 0:
+                await asyncio.wait_for(
+                    self._db.signin({"user": self._user, "pass": self._password}),
+                    timeout=timeout,
+                )
+            else:
+                await self._db.signin({"user": self._user, "pass": self._password})
         await self._db.use(self.NAMESPACE, self.DATABASE)
 
     async def close(self) -> None:
@@ -82,19 +100,40 @@ class UCDatabase:
             raise RuntimeError("Database not connected. Call connect() first.")
         return self._db
 
-    async def query(self, surql: str, params: dict[str, Any] | None = None) -> list[Any]:
+    async def query(
+        self,
+        surql: str,
+        params: dict[str, Any] | None = None,
+        *,
+        _retries: int = 3,
+    ) -> list[Any]:
         """Execute a SurrealQL query and return results.
 
         The SDK may return an error string instead of raising when the server
         reports a transaction/IO failure inside the result payload.  We detect
         that here so callers don't have to guard against non-list returns.
+
+        Transient "Transaction conflict" errors are retried with linear backoff
+        (100ms, 200ms, 300ms) up to ``_retries`` attempts.
         """
-        result = await (self.db.query(surql, params) if params else self.db.query(surql))
-        if isinstance(result, str):
-            raise RuntimeError(f"SurrealDB query error: {result}")
-        if not isinstance(result, list):
-            return [result] if result is not None else []
-        return result
+        for attempt in range(_retries):
+            result = await (self.db.query(surql, params) if params else self.db.query(surql))
+            if isinstance(result, str):
+                if "Transaction conflict" in result and attempt < _retries - 1:
+                    delay = 0.1 * (attempt + 1)
+                    logger.debug(
+                        "Transaction conflict (attempt %d/%d), retrying in %.1fs",
+                        attempt + 1,
+                        _retries,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise RuntimeError(f"SurrealDB query error: {result}")
+            if not isinstance(result, list):
+                return [result] if result is not None else []
+            return result
+        return []  # unreachable but satisfies type checker
 
     async def health(self) -> bool:
         """Check if the database is reachable."""

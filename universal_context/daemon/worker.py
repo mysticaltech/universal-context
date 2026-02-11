@@ -42,7 +42,12 @@ class Worker:
         self._processors[job_type] = processor
 
     async def run(self) -> None:
-        """Run the worker loop until cancelled."""
+        """Run the worker loop until cancelled.
+
+        Transient DB errors (transaction conflicts, write conflicts) are
+        caught and retried after a short delay instead of crashing the
+        entire daemon TaskGroup.
+        """
         self._running = True
         logger.info(
             "Worker started (poll_interval=%.1fs, processors=%s)",
@@ -51,7 +56,15 @@ class Worker:
         )
         try:
             while self._running:
-                processed = await self._claim_and_process()
+                try:
+                    processed = await self._claim_and_process()
+                except RuntimeError as e:
+                    msg = str(e)
+                    if "Transaction conflict" in msg or "write conflict" in msg:
+                        logger.debug("Transient conflict in worker, retrying: %s", e)
+                        await asyncio.sleep(0.5)
+                        continue
+                    raise
                 if not processed:
                     await asyncio.sleep(self._poll_interval)
         except asyncio.CancelledError:

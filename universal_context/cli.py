@@ -46,6 +46,7 @@ app.add_typer(memory_app, name="memory")
 
 # --- Async helper ---
 
+
 def _run_async(coro):
     """Run an async function from sync CLI context."""
     return asyncio.run(coro)
@@ -75,8 +76,10 @@ def _sanitize_record(record: dict[str, Any]) -> dict[str, Any]:
             sanitized[k] = _sanitize_record(v)
         elif isinstance(v, list):
             sanitized[k] = [
-                _sanitize_record(i) if isinstance(i, dict)
-                else str(i) if hasattr(i, "__class__") and "RecordID" in type(i).__name__
+                _sanitize_record(i)
+                if isinstance(i, dict)
+                else str(i)
+                if hasattr(i, "__class__") and "RecordID" in type(i).__name__
                 else i
                 for i in v
             ]
@@ -137,6 +140,7 @@ def doctor() -> None:
 
     try:
         import surrealdb  # noqa: F401
+
         _check("SurrealDB SDK installed", True)
     except ImportError:
         _check("SurrealDB SDK installed", False)
@@ -144,6 +148,7 @@ def doctor() -> None:
     _check("tmux available", shutil.which("tmux") is not None)
 
     from .config import UCConfig
+
     config = UCConfig.load()
     keys = {
         "OpenRouter": config.get_api_key("openrouter"),
@@ -196,7 +201,11 @@ def search(
                     scope_id = str(scope["id"])
 
             results = await search_artifacts(
-                db, query, kind=kind, limit=limit, scope_id=scope_id,
+                db,
+                query,
+                kind=kind,
+                limit=limit,
+                scope_id=scope_id,
             )
 
             if json_output:
@@ -252,13 +261,14 @@ def timeline(
 
             if run_id is None:
                 runs = await list_runs(
-                    db, scope_id=scope_id, branch=branch, limit=1,
+                    db,
+                    scope_id=scope_id,
+                    branch=branch,
+                    limit=1,
                 )
                 if not runs:
                     if json_output:
-                        print(json_mod.dumps(
-                            {"error": "no_runs", "message": "No runs found"}
-                        ))
+                        print(json_mod.dumps({"error": "no_runs", "message": "No runs found"}))
                     else:
                         console.print("[dim]No runs found.[/dim]")
                     return
@@ -267,6 +277,7 @@ def timeline(
             else:
                 rid = run_id
                 from .db.queries import get_run
+
                 run_record = await get_run(db, rid)
 
             turns = await list_turns(db, rid)
@@ -319,9 +330,7 @@ def inspect(
             turn = await get_turn(db, turn_id)
             if not turn:
                 if json_output:
-                    print(json_mod.dumps(
-                        {"error": "not_found", "turn_id": turn_id}
-                    ))
+                    print(json_mod.dumps({"error": "not_found", "turn_id": turn_id}))
                     return
                 console.print(f"[red]Turn not found:[/red] {turn_id}")
                 raise typer.Exit(code=1)
@@ -332,17 +341,22 @@ def inspect(
             if json_output:
                 # Flatten artifact IDs from graph traversal
                 artifact_ids = []
-                for a in (artifacts or []):
+                for a in artifacts or []:
                     produced = a.get("->produced", {})
                     if isinstance(produced, dict):
                         for aid in produced.get("->artifact", []):
                             artifact_ids.append(str(aid))
 
-                print(json_mod.dumps({
-                    **_sanitize_record(turn),
-                    "artifacts": artifact_ids,
-                    "provenance": [_sanitize_record(c) for c in chain] if chain else [],
-                }, default=str))
+                print(
+                    json_mod.dumps(
+                        {
+                            **_sanitize_record(turn),
+                            "artifacts": artifact_ids,
+                            "provenance": [_sanitize_record(c) for c in chain] if chain else [],
+                        },
+                        default=str,
+                    )
+                )
                 return
 
             console.print(f"[bold]Turn {turn_id}[/bold]\n")
@@ -388,11 +402,16 @@ def status(
             jobs = await count_jobs_by_status(db)
 
             if json_output:
-                print(json_mod.dumps({
-                    "scopes": [_sanitize_record(s) for s in scopes],
-                    "recent_runs": [_sanitize_record(r) for r in runs],
-                    "jobs": jobs,
-                }, default=str))
+                print(
+                    json_mod.dumps(
+                        {
+                            "scopes": [_sanitize_record(s) for s in scopes],
+                            "recent_runs": [_sanitize_record(r) for r in runs],
+                            "jobs": jobs,
+                        },
+                        default=str,
+                    )
+                )
                 return
 
             console.print(f"[bold]Scopes:[/bold] {len(scopes)}")
@@ -420,16 +439,14 @@ def context(
     project: Path | None = typer.Option(
         None, "--project", "-p", help="Project path (default: cwd)"
     ),
-    query: str | None = typer.Option(
-        None, "--query", "-q", help="Keyword search query"
-    ),
+    query: str | None = typer.Option(None, "--query", "-q", help="Keyword search query"),
     ctx: str | None = typer.Option(
-        None, "--context", "-c",
+        None,
+        "--context",
+        "-c",
         help="Semantic context — describe what you're working on for embedding-based retrieval",
     ),
-    branch: str | None = typer.Option(
-        None, "--branch", "-b", help="Filter runs by git branch"
-    ),
+    branch: str | None = typer.Option(None, "--branch", "-b", help="Filter runs by git branch"),
     limit: int = typer.Option(5, "--limit", "-n", help="Max runs to show"),
     turns: int = typer.Option(10, "--turns", "-t", help="Max turns per run"),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
@@ -465,14 +482,15 @@ def context(
                 if json_output:
                     print(json_mod.dumps(payload))
                 else:
-                    console.print(
-                        f"[yellow]No scope found for:[/yellow] {project_path}"
-                    )
+                    console.print(f"[yellow]No scope found for:[/yellow] {project_path}")
                 return
 
             scope_id = str(scope["id"])
             runs_data = await list_runs(
-                db, scope_id=scope_id, branch=branch, limit=limit,
+                db,
+                scope_id=scope_id,
+                branch=branch,
+                limit=limit,
             )
 
             # Build run details with summaries
@@ -480,23 +498,28 @@ def context(
             for r in runs_data:
                 rid = str(r["id"])
                 summaries = await get_turn_summaries(db, rid, limit=turns)
-                run_details.append({
-                    "run_id": rid,
-                    "agent_type": r.get("agent_type", ""),
-                    "status": r.get("status", ""),
-                    "started_at": r.get("started_at"),
-                    "branch": r.get("branch"),
-                    "commit_sha": r.get("commit_sha"),
-                    "merged_to": r.get("merged_to"),
-                    "total_turns": len(summaries),
-                    "turns": summaries,
-                })
+                run_details.append(
+                    {
+                        "run_id": rid,
+                        "agent_type": r.get("agent_type", ""),
+                        "status": r.get("status", ""),
+                        "started_at": r.get("started_at"),
+                        "branch": r.get("branch"),
+                        "commit_sha": r.get("commit_sha"),
+                        "merged_to": r.get("merged_to"),
+                        "total_turns": len(summaries),
+                        "turns": summaries,
+                    }
+                )
 
             # Optional keyword search (scope-filtered)
             keyword_results = []
             if query:
                 raw = await search_artifacts(
-                    db, query, kind="summary", scope_id=scope_id,
+                    db,
+                    query,
+                    kind="summary",
+                    scope_id=scope_id,
                 )
                 keyword_results = [_sanitize_record(sr) for sr in raw]
 
@@ -504,22 +527,29 @@ def context(
             semantic_results = []
             if ctx:
                 semantic_results = await _semantic_search(
-                    db, ctx, query, scope_id=scope_id,
+                    db,
+                    ctx,
+                    query,
+                    scope_id=scope_id,
                 )
 
             if json_output:
-                print(json_mod.dumps({
-                    "scope": _sanitize_record(scope),
-                    "runs": run_details,
-                    "search_results": keyword_results,
-                    "semantic_results": semantic_results,
-                }, default=str))
+                print(
+                    json_mod.dumps(
+                        {
+                            "scope": _sanitize_record(scope),
+                            "runs": run_details,
+                            "search_results": keyword_results,
+                            "semantic_results": semantic_results,
+                        },
+                        default=str,
+                    )
+                )
                 return
 
             # Rich output
             console.print(
-                f"[bold]Scope:[/bold] {scope.get('name')} "
-                f"[dim]({scope.get('path')})[/dim]\n"
+                f"[bold]Scope:[/bold] {scope.get('name')} [dim]({scope.get('path')})[/dim]\n"
             )
 
             if not run_details:
@@ -543,22 +573,18 @@ def context(
             if keyword_results:
                 console.print(f"[bold]Keyword results for '{query}':[/bold]")
                 for sr in keyword_results:
-                    console.print(
-                        f"  {sr.get('id')}  {sr.get('content', '')[:60]}"
-                    )
+                    console.print(f"  {sr.get('id')}  {sr.get('content', '')[:60]}")
 
             if semantic_results:
                 console.print(
-                    f"\n[bold]Semantic matches for context:[/bold] "
-                    f"[dim]({ctx[:40]}...)[/dim]" if ctx and len(ctx) > 40
+                    f"\n[bold]Semantic matches for context:[/bold] [dim]({ctx[:40]}...)[/dim]"
+                    if ctx and len(ctx) > 40
                     else "\n[bold]Semantic matches:[/bold]"
                 )
                 for sr in semantic_results:
                     score = sr.get("score", 0)
                     content = sr.get("content", "")[:60]
-                    console.print(
-                        f"  [cyan]{score:.3f}[/cyan]  {sr.get('id')}  {content}"
-                    )
+                    console.print(f"  [cyan]{score:.3f}[/cyan]  {sr.get('id')}  {content}")
 
         finally:
             await db.close()
@@ -593,13 +619,20 @@ async def _semantic_search(
 
         if keyword_query:
             results = await hybrid_search(
-                db, keyword_query, query_embedding,
-                kind="summary", limit=10, scope_id=scope_id,
+                db,
+                keyword_query,
+                query_embedding,
+                kind="summary",
+                limit=10,
+                scope_id=scope_id,
             )
         else:
             results = await semantic_search(
-                db, query_embedding,
-                kind="summary", limit=10, scope_id=scope_id,
+                db,
+                query_embedding,
+                kind="summary",
+                limit=10,
+                scope_id=scope_id,
             )
 
         return [_sanitize_record(r) for r in results]
@@ -640,37 +673,33 @@ def ask(
             if scope_id:
                 memory = await get_working_memory(db, scope_id)
                 if memory and memory.get("content"):
-                    context_parts.append(
-                        f"## Working Memory\n{memory['content']}"
-                    )
+                    context_parts.append(f"## Working Memory\n{memory['content']}")
 
             # Keyword search for relevant artifacts
             search_results = await search_artifacts(
-                db, question, kind="summary", limit=limit, scope_id=scope_id,
+                db,
+                question,
+                kind="summary",
+                limit=limit,
+                scope_id=scope_id,
             )
             if search_results:
                 summaries_text = "\n".join(
                     f"- {r.get('content', '')[:500]}" for r in search_results
                 )
-                context_parts.append(
-                    f"## Relevant Session Summaries\n{summaries_text}"
-                )
+                context_parts.append(f"## Relevant Session Summaries\n{summaries_text}")
 
             # Also try semantic search if embed provider available
             semantic_results = await _semantic_search(
-                db, question, scope_id=scope_id,
+                db,
+                question,
+                scope_id=scope_id,
             )
             # Filter out error dicts
-            valid_semantic = [
-                r for r in semantic_results if "error" not in r
-            ]
+            valid_semantic = [r for r in semantic_results if "error" not in r]
             if valid_semantic:
-                sem_text = "\n".join(
-                    f"- {r.get('content', '')[:500]}" for r in valid_semantic
-                )
-                context_parts.append(
-                    f"## Semantic Matches\n{sem_text}"
-                )
+                sem_text = "\n".join(f"- {r.get('content', '')[:500]}" for r in valid_semantic)
+                context_parts.append(f"## Semantic Matches\n{sem_text}")
 
             if not context_parts:
                 payload = {
@@ -686,27 +715,32 @@ def ask(
 
             # Build the LLM prompt
             context_block = "\n\n".join(context_parts)
-            prompt = (
-                f"## Project Context\n{context_block}\n\n"
-                f"## Question\n{question}"
-            )
+            prompt = f"## Project Context\n{context_block}\n\n## Question\n{question}"
 
             # Try LLM
             llm_fn = await create_llm_fn(
-                config, system_prompt=ASK_SYSTEM_PROMPT, max_tokens=1000,
+                config,
+                system_prompt=ASK_SYSTEM_PROMPT,
+                max_tokens=1000,
             )
 
             if llm_fn is None:
                 # Fallback: show raw context
                 if json_output:
-                    print(json_mod.dumps({
-                        "answer": None,
-                        "context": context_block,
-                        "message": "No LLM configured. Showing raw context.",
-                    }, default=str))
+                    print(
+                        json_mod.dumps(
+                            {
+                                "answer": None,
+                                "context": context_block,
+                                "message": "No LLM configured. Showing raw context.",
+                            },
+                            default=str,
+                        )
+                    )
                 else:
                     console.print("[yellow]No LLM configured — showing raw context:[/yellow]\n")
                     from rich.markdown import Markdown
+
                     console.print(Markdown(context_block))
                 return
 
@@ -716,20 +750,27 @@ def ask(
             answer = await llm_fn(prompt)
 
             if json_output:
-                print(json_mod.dumps({
-                    "answer": answer,
-                    "sources": len(search_results) + len(valid_semantic),
-                    "scope": scope_id,
-                }, default=str))
+                print(
+                    json_mod.dumps(
+                        {
+                            "answer": answer,
+                            "sources": len(search_results) + len(valid_semantic),
+                            "scope": scope_id,
+                        },
+                        default=str,
+                    )
+                )
             else:
                 from rich.markdown import Markdown
                 from rich.panel import Panel
 
-                console.print(Panel(
-                    Markdown(answer),
-                    title="Answer",
-                    border_style="green",
-                ))
+                console.print(
+                    Panel(
+                        Markdown(answer),
+                        title="Answer",
+                        border_style="green",
+                    )
+                )
                 console.print(
                     f"[dim]Sources: {len(search_results)} keyword + "
                     f"{len(valid_semantic)} semantic matches[/dim]"
@@ -796,11 +837,13 @@ def reason(
         from rich.markdown import Markdown
         from rich.panel import Panel
 
-        console.print(Panel(
-            Markdown(result["answer"]),
-            title="Answer",
-            border_style="green",
-        ))
+        console.print(
+            Panel(
+                Markdown(result["answer"]),
+                title="Answer",
+                border_style="green",
+            )
+        )
 
         if verbose and result.get("trajectory"):
             console.print("\n[bold]Trajectory:[/bold]")
@@ -811,6 +854,7 @@ def reason(
                     console.print(f"\n[cyan]Step {i}:[/cyan]")
                     if code:
                         from rich.syntax import Syntax
+
                         console.print(Syntax(str(code), "python", theme="monokai"))
                     if output:
                         console.print(f"[dim]{str(output)[:500]}[/dim]")
@@ -864,11 +908,24 @@ def dashboard(
 # --- Daemon sub-commands ---
 
 
+def _pid_alive(pid: int) -> bool:
+    """Check if a process is running (Unix only).
+
+    Uses signal 0 to probe. EPERM means the process exists but we lack
+    permission (still alive). ESRCH means no such process (dead).
+    """
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True  # Process exists but we can't signal it
+    except ProcessLookupError:
+        return False
+
+
 @daemon_app.command("start")
 def daemon_start(
-    foreground: bool = typer.Option(
-        False, "--foreground", "-f", help="Run in foreground"
-    ),
+    foreground: bool = typer.Option(False, "--foreground", "-f", help="Run in foreground"),
 ) -> None:
     """Start the UC daemon (watcher + worker)."""
     from .daemon.core import run_daemon
@@ -876,10 +933,18 @@ def daemon_start(
     uc_home = get_uc_home()
     pid_file = uc_home / "daemon.pid"
 
+    # Stale PID detection
     if pid_file.exists():
-        pid = pid_file.read_text().strip()
-        console.print(f"[yellow]Daemon may already be running (PID: {pid})[/yellow]")
-        return
+        try:
+            pid = int(pid_file.read_text().strip())
+        except (ValueError, OSError):
+            pid_file.unlink(missing_ok=True)
+            pid = 0
+        if pid and _pid_alive(pid):
+            console.print(f"[yellow]Daemon already running (PID: {pid})[/yellow]")
+            return
+        # Stale PID file — clean up
+        pid_file.unlink(missing_ok=True)
 
     if foreground:
         console.print("[bold]Starting UC daemon in foreground...[/bold]")
@@ -890,10 +955,27 @@ def daemon_start(
         finally:
             pid_file.unlink(missing_ok=True)
     else:
-        console.print(
-            "[dim]Background mode not yet implemented. "
-            "Use --foreground or run in a tmux/screen session.[/dim]"
+        import subprocess
+        import sys
+        import time
+
+        log_path = uc_home / "logs" / "daemon.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = open(log_path, "a")  # noqa: SIM115
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "universal_context.cli", "daemon", "start", "-f"],
+            stdout=log_file,
+            stderr=log_file,
+            start_new_session=True,
         )
+        # Brief wait to confirm it started
+        time.sleep(1)
+        if proc.poll() is None:
+            console.print(f"[green]Daemon started (PID: {proc.pid})[/green]")
+            console.print(f"[dim]Log: {log_path}[/dim]")
+        else:
+            console.print("[red]Daemon failed to start. Check logs:[/red]")
+            console.print(f"[dim]{log_path}[/dim]")
 
 
 @daemon_app.command("stop")
@@ -905,14 +987,25 @@ def daemon_stop() -> None:
         console.print("[yellow]Daemon is not running.[/yellow]")
         return
 
-    pid = int(pid_file.read_text().strip())
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (ValueError, OSError):
+        pid_file.unlink(missing_ok=True)
+        console.print("[yellow]Invalid PID file — cleaned up.[/yellow]")
+        return
+
+    if not _pid_alive(pid):
+        console.print(
+            f"[yellow]Daemon process {pid} not found — cleaning up stale PID file.[/yellow]"
+        )
+        pid_file.unlink(missing_ok=True)
+        return
+
     try:
         os.kill(pid, signal.SIGTERM)
         console.print(f"[green]Sent SIGTERM to daemon (PID: {pid})[/green]")
     except ProcessLookupError:
-        console.print(
-            f"[yellow]Daemon process {pid} not found — cleaning up PID file.[/yellow]"
-        )
+        console.print(f"[yellow]Daemon process {pid} vanished — cleaning up PID file.[/yellow]")
     pid_file.unlink(missing_ok=True)
 
 
@@ -922,8 +1015,15 @@ def daemon_status() -> None:
     uc_home = get_uc_home()
     pid_file = uc_home / "daemon.pid"
     if pid_file.exists():
-        pid = pid_file.read_text().strip()
-        console.print(f"[green]Daemon running[/green] (PID: {pid})")
+        try:
+            pid = int(pid_file.read_text().strip())
+        except (ValueError, OSError):
+            console.print("[dim]Daemon is not running (invalid PID file).[/dim]")
+            return
+        if _pid_alive(pid):
+            console.print(f"[green]Daemon running[/green] (PID: {pid})")
+        else:
+            console.print(f"[yellow]Daemon not running (stale PID: {pid})[/yellow]")
     else:
         console.print("[dim]Daemon is not running.[/dim]")
 
@@ -1008,7 +1108,10 @@ def share_import(
                     target_scope_id = str(scope["id"])
 
             result = await import_bundle(
-                db, bundle, passphrase=passphrase, target_scope_id=target_scope_id,
+                db,
+                bundle,
+                passphrase=passphrase,
+                target_scope_id=target_scope_id,
             )
             console.print(
                 f"[green]Imported:[/green] {result['turns_imported']} turns, "
@@ -1091,9 +1194,7 @@ def scope_list(
             scopes = await list_scopes_with_stats(db)
 
             if json_output:
-                print(json_mod.dumps(
-                    [_sanitize_record(s) for s in scopes], default=str
-                ))
+                print(json_mod.dumps([_sanitize_record(s) for s in scopes], default=str))
                 return
 
             if not scopes:
@@ -1111,9 +1212,7 @@ def scope_list(
             table.add_column("Last Activity", style="dim")
 
             for s in scopes:
-                agents = ", ".join(
-                    f"{k}({v})" for k, v in s.get("agent_breakdown", {}).items()
-                )
+                agents = ", ".join(f"{k}({v})" for k, v in s.get("agent_breakdown", {}).items())
                 last = str(s.get("last_activity", ""))[:19] if s.get("last_activity") else ""
                 table.add_row(
                     str(s["id"]),
@@ -1278,8 +1377,7 @@ def scope_merge(
 
             await merge_scopes(db, src_id, tgt_id)
             console.print(
-                f"[green]Merged[/green] {src_id} ({src['name']}) "
-                f"-> {tgt_id} ({tgt['name']})"
+                f"[green]Merged[/green] {src_id} ({src['name']}) -> {tgt_id} ({tgt['name']})"
             )
         finally:
             await db.close()
@@ -1381,9 +1479,7 @@ def scope_cleanup(
                 console.print("[green]No garbage scopes found.[/green]")
                 return
 
-            table = Table(
-                title="Garbage Scopes" + (" (dry run)" if dry_run else "")
-            )
+            table = Table(title="Garbage Scopes" + (" (dry run)" if dry_run else ""))
             table.add_column("ID", style="cyan")
             table.add_column("Name")
             table.add_column("Path", max_width=40)
@@ -1408,9 +1504,7 @@ def scope_cleanup(
             else:
                 for g in garbage:
                     await delete_scope(db, str(g["id"]))
-                console.print(
-                    f"\n[green]Removed {len(garbage)} garbage scopes.[/green]"
-                )
+                console.print(f"\n[green]Removed {len(garbage)} garbage scopes.[/green]")
         finally:
             await db.close()
 
@@ -1423,10 +1517,16 @@ def scope_cleanup(
 @memory_app.command("show")
 def memory_show(
     project: Path | None = typer.Option(
-        None, "--project", "-p", help="Project path (default: cwd)",
+        None,
+        "--project",
+        "-p",
+        help="Project path (default: cwd)",
     ),
     format_mode: str = typer.Option(
-        "plain", "--format", "-f", help="Output format: plain, inject",
+        "plain",
+        "--format",
+        "-f",
+        help="Output format: plain, inject",
     ),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
 ) -> None:
@@ -1457,10 +1557,14 @@ def memory_show(
                 if format_mode == "inject":
                     return  # Silent for hook injection
                 if json_output:
-                    print(json_mod.dumps({
-                        "error": "no_memory",
-                        "scope": _sanitize_record(scope),
-                    }))
+                    print(
+                        json_mod.dumps(
+                            {
+                                "error": "no_memory",
+                                "scope": _sanitize_record(scope),
+                            }
+                        )
+                    )
                 else:
                     console.print("[dim]No working memory for this project yet.[/dim]")
                     console.print("[dim]Run: uc memory refresh --project .[/dim]")
@@ -1469,10 +1573,15 @@ def memory_show(
             content = memory.get("content", "")
 
             if json_output:
-                print(json_mod.dumps({
-                    **_sanitize_record(memory),
-                    "scope": _sanitize_record(scope),
-                }, default=str))
+                print(
+                    json_mod.dumps(
+                        {
+                            **_sanitize_record(memory),
+                            "scope": _sanitize_record(scope),
+                        },
+                        default=str,
+                    )
+                )
             elif format_mode == "inject":
                 # Raw markdown for hook injection — no Rich formatting
                 print(content)
@@ -1480,16 +1589,17 @@ def memory_show(
                 from rich.markdown import Markdown
                 from rich.panel import Panel
 
-                console.print(Panel(
-                    Markdown(content),
-                    title=f"Working Memory: {scope.get('name', '')}",
-                    border_style="blue",
-                ))
+                console.print(
+                    Panel(
+                        Markdown(content),
+                        title=f"Working Memory: {scope.get('name', '')}",
+                        border_style="blue",
+                    )
+                )
                 created = str(memory.get("created_at", ""))[:19]
                 method = memory.get("metadata", {}).get("method", "")
                 console.print(
-                    f"[dim]Updated: {created}  Method: {method}  "
-                    f"ID: {memory.get('id')}[/dim]"
+                    f"[dim]Updated: {created}  Method: {method}  ID: {memory.get('id')}[/dim]"
                 )
         finally:
             await db.close()
@@ -1500,7 +1610,10 @@ def memory_show(
 @memory_app.command("refresh")
 def memory_refresh(
     project: Path | None = typer.Option(
-        None, "--project", "-p", help="Project path (default: cwd)",
+        None,
+        "--project",
+        "-p",
+        help="Project path (default: cwd)",
     ),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
 ) -> None:
@@ -1528,9 +1641,7 @@ def memory_refresh(
             # Backfill canonical_ids on scopes (git-aware dedup)
             cid_backfilled = await backfill_canonical_ids(db)
             if cid_backfilled and not json_output:
-                console.print(
-                    f"[dim]Backfilled canonical_id on {cid_backfilled} scopes.[/dim]"
-                )
+                console.print(f"[dim]Backfilled canonical_id on {cid_backfilled} scopes.[/dim]")
 
             # Backfill scope on any existing artifacts that lack it
             backfilled = await backfill_artifact_scopes(db)
@@ -1576,12 +1687,17 @@ def memory_refresh(
             if json_output:
                 # Include the actual memory content
                 memory = await get_working_memory(db, scope_id)
-                print(json_mod.dumps({
-                    "result": result,
-                    "memory": _sanitize_record(memory) if memory else None,
-                    "hnsw_rebuilt": rebuilt,
-                    "backfilled": backfilled,
-                }, default=str))
+                print(
+                    json_mod.dumps(
+                        {
+                            "result": result,
+                            "memory": _sanitize_record(memory) if memory else None,
+                            "hnsw_rebuilt": rebuilt,
+                            "backfilled": backfilled,
+                        },
+                        default=str,
+                    )
+                )
             else:
                 if result.get("status") == "skipped":
                     console.print(f"[yellow]Skipped:[/yellow] {result.get('reason')}")
@@ -1601,7 +1717,10 @@ def memory_refresh(
 @memory_app.command("history")
 def memory_history(
     project: Path | None = typer.Option(
-        None, "--project", "-p", help="Project path (default: cwd)",
+        None,
+        "--project",
+        "-p",
+        help="Project path (default: cwd)",
     ),
     limit: int = typer.Option(5, "--limit", "-n", help="Max versions to show"),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
@@ -1629,9 +1748,12 @@ def memory_history(
             versions = await get_working_memory_history(db, scope_id, limit=limit)
 
             if json_output:
-                print(json_mod.dumps(
-                    [_sanitize_record(v) for v in versions], default=str,
-                ))
+                print(
+                    json_mod.dumps(
+                        [_sanitize_record(v) for v in versions],
+                        default=str,
+                    )
+                )
                 return
 
             if not versions:
@@ -1691,13 +1813,17 @@ def memory_install_hook() -> None:
                 console.print("[dim]Hook already installed.[/dim]")
                 return
 
-    session_start.append({
-        "matcher": "",
-        "hooks": [{
-            "type": "command",
-            "command": hook_command,
-        }],
-    })
+    session_start.append(
+        {
+            "matcher": "",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": hook_command,
+                }
+            ],
+        }
+    )
 
     settings_path.write_text(
         json_mod.dumps(settings, indent=2, ensure_ascii=False) + "\n",
@@ -1715,10 +1841,15 @@ _MEMORY_END = "<!-- UC:MEMORY:END -->"
 @memory_app.command("inject")
 def memory_inject(
     project: Path | None = typer.Option(
-        None, "--project", "-p", help="Project path (default: cwd)",
+        None,
+        "--project",
+        "-p",
+        help="Project path (default: cwd)",
     ),
     target: str = typer.Option(
-        "AGENTS.md", "--target", "-t",
+        "AGENTS.md",
+        "--target",
+        "-t",
         help="Target file to inject into (AGENTS.md, CLAUDE.md, etc.)",
     ),
 ) -> None:
@@ -1746,8 +1877,7 @@ def memory_inject(
             memory = await get_working_memory(db, scope_id)
             if not memory:
                 console.print(
-                    "[dim]No working memory yet. "
-                    "Run: uc memory refresh --project .[/dim]"
+                    "[dim]No working memory yet. Run: uc memory refresh --project .[/dim]"
                 )
                 return
 
@@ -1760,6 +1890,7 @@ def memory_inject(
                 # Replace existing memory section or append
                 if _MEMORY_START in existing:
                     import re
+
                     pattern = re.escape(_MEMORY_START) + r".*?" + re.escape(_MEMORY_END)
                     new_content = re.sub(pattern, memory_block, existing, flags=re.DOTALL)
                 else:
@@ -1768,9 +1899,7 @@ def memory_inject(
                 new_content = memory_block + "\n"
 
             target_path.write_text(new_content, encoding="utf-8")
-            console.print(
-                f"[green]Injected working memory into[/green] {target_path.name}"
-            )
+            console.print(f"[green]Injected working memory into[/green] {target_path.name}")
         finally:
             await db.close()
 
@@ -1780,10 +1909,15 @@ def memory_inject(
 @memory_app.command("eject")
 def memory_eject(
     project: Path | None = typer.Option(
-        None, "--project", "-p", help="Project path (default: cwd)",
+        None,
+        "--project",
+        "-p",
+        help="Project path (default: cwd)",
     ),
     target: str = typer.Option(
-        "AGENTS.md", "--target", "-t",
+        "AGENTS.md",
+        "--target",
+        "-t",
         help="Target file to eject from",
     ),
 ) -> None:
