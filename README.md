@@ -177,11 +177,11 @@ The embedded mode works immediately with no extra setup. When you're ready for f
 
 ```bash
 # Install SurrealDB v3 (must specify version — default installs v2)
-curl -sSf https://install.surrealdb.com | sh -s -- --version v3.0.0-beta.3
+curl -sSf https://install.surrealdb.com | sh -s -- --version v3.0.0-beta.4
 
 # Verify you have v3
 surreal version
-# Expected: 3.0.0-beta.3
+# Expected: 3.0.0-beta.4
 
 # Start the server
 surreal start --bind 127.0.0.1:8000 --user root --pass root surrealkv://~/.surrealdb/data

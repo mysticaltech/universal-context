@@ -130,7 +130,7 @@ tests/                      # 341 tests
 
 ## SurrealDB Notes
 
-- **v3 only** — targets SurrealDB v3.0.0-beta.3+
+- **v3 only** — targets SurrealDB v3.0.0-beta.4+
 - Python SDK: `surrealdb @ git+https://github.com/surrealdb/surrealdb.py.git@1ff4470e`
 - Edge tables must be SCHEMALESS (`RELATE` manages `in`/`out` automatically)
 - Object fields on SCHEMAFULL tables need `DEFAULT {}` or SurrealDB rejects NONE values
