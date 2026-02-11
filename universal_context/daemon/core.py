@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 from pathlib import Path
 
@@ -36,8 +37,13 @@ class UCDaemon:
         self._worker: Worker | None = None
         self._shutdown_event = asyncio.Event()
 
+    # Minimum free disk space required to start (256 MB).
+    MIN_FREE_BYTES = 256 * 1024 * 1024
+
     async def start(self) -> None:
         """Start the daemon: connect DB, apply schema, run watcher + worker."""
+        self._check_disk_space()
+
         # Initialize database — server URL takes priority over embedded path
         if self._config.db_url:
             self._db = UCDatabase.from_url(
@@ -111,6 +117,26 @@ class UCDaemon:
             tg.create_task(self._watcher.run(), name="watcher")
             tg.create_task(self._worker.run(), name="worker")
             tg.create_task(self._wait_for_shutdown(), name="shutdown-monitor")
+
+    def _check_disk_space(self) -> None:
+        """Abort startup if disk space is critically low.
+
+        A full disk silently corrupts SurrealKV (incomplete WAL flushes,
+        missing sstable segments).  Failing fast here avoids data loss.
+        """
+        check_path = Path(self._config.resolved_db_path).parent
+        check_path.mkdir(parents=True, exist_ok=True)
+        stat = os.statvfs(check_path)
+        free = stat.f_bavail * stat.f_frsize
+        if free < self.MIN_FREE_BYTES:
+            free_mb = free / (1024 * 1024)
+            min_mb = self.MIN_FREE_BYTES / (1024 * 1024)
+            raise RuntimeError(
+                f"Disk space critically low: {free_mb:.0f} MB free "
+                f"(minimum {min_mb:.0f} MB). Refusing to start to prevent "
+                f"database corruption."
+            )
+        logger.info("Disk space OK: %.0f MB free", free / (1024 * 1024))
 
     async def _wait_for_shutdown(self) -> None:
         """Wait for shutdown signal, then cancel sibling tasks."""

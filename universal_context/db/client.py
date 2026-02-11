@@ -83,10 +83,18 @@ class UCDatabase:
         return self._db
 
     async def query(self, surql: str, params: dict[str, Any] | None = None) -> list[Any]:
-        """Execute a SurrealQL query and return results."""
-        if params:
-            return await self.db.query(surql, params)
-        return await self.db.query(surql)
+        """Execute a SurrealQL query and return results.
+
+        The SDK may return an error string instead of raising when the server
+        reports a transaction/IO failure inside the result payload.  We detect
+        that here so callers don't have to guard against non-list returns.
+        """
+        result = await (self.db.query(surql, params) if params else self.db.query(surql))
+        if isinstance(result, str):
+            raise RuntimeError(f"SurrealDB query error: {result}")
+        if not isinstance(result, list):
+            return [result] if result is not None else []
+        return result
 
     async def health(self) -> bool:
         """Check if the database is reachable."""

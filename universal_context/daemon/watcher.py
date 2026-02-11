@@ -97,13 +97,19 @@ class Watcher:
             path_key = str(session_path)
             seen_paths.add(path_key)
 
-            if path_key in self._sessions:
-                # Known session — check for new turns
-                state = self._sessions[path_key]
-                await self._check_new_turns(state, adapter)
-            else:
-                # New session — register it
-                await self._register_session(session_path, adapter)
+            try:
+                if path_key in self._sessions:
+                    # Known session — check for new turns
+                    state = self._sessions[path_key]
+                    await self._check_new_turns(state, adapter)
+                else:
+                    # New session — register it
+                    await self._register_session(session_path, adapter)
+            except Exception as exc:
+                logger.error(
+                    "Error processing session %s: %s", session_path.name, exc,
+                )
+                continue
 
         # Detect ended sessions (no longer discovered)
         ended = set(self._sessions.keys()) - seen_paths
