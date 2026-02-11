@@ -8,7 +8,7 @@ Operational memory engine for AI agents. Captures sessions from Claude Code, Cod
 
 ```bash
 # Dev install
-uv pip install -e ".[dev,llm,reason]"
+uv pip install -e ".[dev,llm]"
 
 # CLI
 uc --help
@@ -125,7 +125,7 @@ tests/                      # 341 tests
 14. **D14**: Merge detection — watcher tags runs from feature branches whose commits are ancestors of the current branch (`merged_to` field)
 15. **D15**: v2 share bundles — carry scope metadata (name, path, canonical_id) for cross-machine scope matching on import
 16. **D16**: SurrealDB v2 embedded NONE quirk — `WHERE field = NONE` doesn't match; use `WHERE !field` for falsy checks on option fields
-17. **D17**: DSPy RLM for agentic reasoning — LLM writes Python in a REPL loop to explore the graph database. Optional dependency (`pip install .[reason]`). LocalInterpreter (in-process, no Deno/WASM), AsyncBridge wraps main event loop, tools submit coroutines via `run_coroutine_threadsafe()`
+17. **D17**: DSPy RLM for agentic reasoning — LLM writes Python in a REPL loop to explore the graph database. Core dependency (requires DSPy ≥3.1.1 where RLM was introduced). LocalInterpreter (in-process, no Deno/WASM), AsyncBridge wraps main event loop, tools submit coroutines via `run_coroutine_threadsafe()`
 18. **D18**: HNSW schema resilience — `apply_schema()` catches HNSW index creation failures gracefully (SurrealDB v3 beta corruption). Search self-heals via brute-force cosine fallback
 
 ## SurrealDB Notes

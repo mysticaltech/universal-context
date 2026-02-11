@@ -797,21 +797,9 @@ def reason(
     Uses DSPy's RLM module to let the LLM programmatically search,
     navigate, and query UC's graph database. More thorough than `uc ask`
     but slower and more expensive.
-
-    Requires: pip install universal-context[reason]
     """
 
     async def _reason():
-        try:
-            import dspy  # noqa: F401
-        except ImportError:
-            console.print(
-                "[red]DSPy is not installed.[/red]\n"
-                "Install it with: [cyan]pip install universal-context[reason][/cyan]\n"
-                "Or: [cyan]pip install dspy>=2.6[/cyan]"
-            )
-            raise typer.Exit(code=1)
-
         from .config import UCConfig
         from .reason import reason as run_reason
 

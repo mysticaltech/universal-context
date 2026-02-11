@@ -37,7 +37,14 @@ uc reason "Trace the scope implementation" --project . --json
 
 This uses DSPy's RLM (Recursive Language Model) — the LLM writes Python in a REPL loop to explore the graph database, calling tools like `get_working_memory()`, `search_sessions()`, `search_semantic()`, `list_recent_runs()`, `get_run_turns()`, and `query_graph()`. Much more thorough than `uc ask` for questions requiring multi-step exploration.
 
-Requires: `pip install universal-context[reason]` (installs DSPy).
+**Important operational notes:**
+- `uc reason` is **slow** — typically 30–90 seconds, sometimes longer. The LLM runs multiple REPL iterations (up to 12 by default), each making DB queries and LLM calls.
+- **Always use a long timeout** when calling via Bash tool: `timeout: 120000` (120s) or higher.
+- Use `--verbose` to see the step-by-step trajectory (what queries the LLM ran).
+- Use `--max-iterations` and `--max-llm-calls` to control cost/time tradeoffs.
+- Prefer `uc ask` for simple questions — reserve `uc reason` for questions that need multi-hop exploration (e.g., tracing how something evolved, understanding decisions across sessions).
+
+DSPy is a core dependency — no extra install step needed.
 
 ## Working memory
 
@@ -145,9 +152,9 @@ uc memory inject --project .     # writes to AGENTS.md
 
 ```
 # Questions
-uc ask "question" --project .                    # LLM-powered Q&A (best for specific questions)
+uc ask "question" --project .                    # LLM-powered Q&A (fast, best for specific questions)
 uc ask "question" --project . --json             # JSON output
-uc reason "question" --project .                 # Agentic multi-hop reasoning (DSPy RLM)
+uc reason "question" --project .                 # Agentic multi-hop reasoning (SLOW: 30-90s, use timeout≥120s)
 uc reason "question" --project . --verbose       # Show REPL trajectory
 uc reason "question" --project . --json          # JSON output with trajectory
 
