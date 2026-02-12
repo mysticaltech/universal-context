@@ -28,7 +28,6 @@ def test_admin_help_contains_operator_commands_not_checkpoint():
     result = runner.invoke(cli_mod.app, ["admin", "--help"])
     assert result.exit_code == 0
     output = result.stdout
-    assert "search" in output
     assert "context" in output
     assert "reason" in output
     assert "scope" in output

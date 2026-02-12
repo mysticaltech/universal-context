@@ -112,7 +112,6 @@ uc memory --help
 # Admin surface
 uc admin --help
 uc admin context --project . --branch main --json
-uc admin search "query"
 uc admin reason "question" --verbose
 uc admin timeline --json
 uc admin inspect turn:abc123 --json

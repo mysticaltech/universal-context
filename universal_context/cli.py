@@ -208,64 +208,6 @@ def doctor() -> None:
         console.print("  [dim]Daemon: not running[/dim]")
 
 
-@admin_app.command("search")
-def search(
-    query: str = typer.Argument(..., help="Search query"),
-    project: Path | None = typer.Option(
-        None, "--project", "-p", help="Scope search to a project path"
-    ),
-    kind: str | None = typer.Option(None, "--kind", "-k", help="Filter by artifact kind"),
-    limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
-    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
-) -> None:
-    """Full-text search across artifacts."""
-
-    async def _search():
-        from .db.queries import search_artifacts
-        from .db.schema import apply_schema
-
-        db = _get_db()
-        await db.connect()
-        try:
-            await apply_schema(db)
-
-            scope_id = None
-            if project is not None:
-                project_path = str(project.resolve())
-                scope = await _resolve_scope(db, project_path)
-                if scope:
-                    scope_id = str(scope["id"])
-
-            results = await search_artifacts(
-                db,
-                query,
-                kind=kind,
-                limit=limit,
-                scope_id=scope_id,
-            )
-
-            if json_output:
-                sanitized = [_sanitize_search_result(r) for r in results]
-                print(json_mod.dumps(sanitized, default=str))
-                return
-
-            if not results:
-                console.print("[dim]No results found.[/dim]")
-                return
-
-            table = Table(title=f"Search: {query}")
-            table.add_column("ID", style="cyan")
-            table.add_column("Kind", style="green")
-            table.add_column("Content", max_width=60)
-            for r in results:
-                content = r.get("content", "")[:60]
-                table.add_row(str(r["id"]), r.get("kind", ""), content)
-            console.print(table)
-        finally:
-            await db.close()
-
-    _run_async(_search())
-
 
 @admin_app.command("timeline")
 def timeline(
@@ -633,6 +575,8 @@ async def _semantic_search(
     context_text: str,
     keyword_query: str | None = None,
     scope_id: str | None = None,
+    kind: str | None = "summary",
+    limit: int = 10,
 ) -> list[dict[str, Any]]:
     """Embed context text and run hybrid or vector-only search.
 
@@ -658,16 +602,16 @@ async def _semantic_search(
                 db,
                 keyword_query,
                 query_embedding,
-                kind="summary",
-                limit=10,
+                kind=kind,
+                limit=limit,
                 scope_id=scope_id,
             )
         else:
             results = await semantic_search(
                 db,
                 query_embedding,
-                kind="summary",
-                limit=10,
+                kind=kind,
+                limit=limit,
                 scope_id=scope_id,
             )
 
@@ -739,6 +683,8 @@ def find(
                     text,
                     keyword_query=semantic_query,
                     scope_id=scope_id,
+                    kind=kind,
+                    limit=limit,
                 )
 
             valid_semantic = [r for r in semantic_results if "error" not in r]

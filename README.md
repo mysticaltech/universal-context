@@ -300,7 +300,6 @@ uc daemon stop                             # Stop the daemon
 
 ```bash
 uc admin --help                             # Full operator surface
-uc admin search "query"                     # Legacy direct search command
 uc admin context --project . --branch main  # Run/branch context views
 uc admin reason "question" -v               # Legacy deep-reasoning command
 uc admin timeline --branch main             # Inspect run timelines

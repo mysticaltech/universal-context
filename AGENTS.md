@@ -32,7 +32,6 @@ uc memory inject --project .
 
 # Admin-only commands
 uc admin --help
-uc admin search "query"
 uc admin reason "question" --verbose   # legacy deep entrypoint (prefer `uc ask --deep`)
 uc admin context --project . --branch main --json
 uc admin share export run:abc123 -o bundle.json
@@ -184,3 +183,12 @@ tests/                      # 382 tests
 - Embedding tests use fake deterministic vectors + `MagicMock` providers
 - Full search integration (BM25 + HNSW KNN) requires a running v3 server
 - `pytest -m "not integration"` skips tests that need API keys
+
+<!-- UC:MEMORY:START -->
+# Project Memory: UniversalContext
+
+## Architecture & Key Decisions
+- SurrealDB v3.0.0-beta.4 prod (skv019 "memtable history insufficient" #6872 repro; fallback stable); schemas: run/turn/artifacts/scopes/jobs/checkpoints/edges (depends_on/contains/produced); queries.py CRUD (claim_next_job CAS UPDATE status="pending" WHERE="pending"; find_runs_by_session_path no LIMIT perf note; dead find_run_by_session_path rm'd); bundle e/i full-graph JSON ID remap, turn_transcripts dict, depends_on list (strict v2 req→ValueError reject old v2/v1 no mig; roundtrip verified bd134b3)
+- watcher.py: multi-crash dedup max turns, recover_interrupted_runs SELECT id FROM run WHERE="active" no LIMIT, delete_scope cascade leaf→root (checkpoints→edges→artifacts→scopes), merge_scopes new edges dup check pre-insert; _register_session dedup reuse completed/skip crashed, prune_stale_pending_jobs kill leftovers w/ summaries, recover_stale_running_jobs reset zombies; tests deterministic started_at UPDATE (no sleep)
+- Alpha no b/c: intent-first CLI, structured deep-reasoning output, cmd reorganization, tests/CI (ae7554f 1.6K LoC 19 files); LLM config-driven (reason, LongMemEval OpenRouter grok-4.1-fast API key); tasks
+<!-- UC:MEMORY:END -->
