@@ -1,5 +1,7 @@
 # Universal Context — Agent Development Guide
 
+> Local note: this file is project-specific only. Global operating rules live in `~/.claude/CLAUDE.md` (symlinked to `~/.agents/AGENTS.md` and `~/.codex/AGENTS.md`).
+
 ## What This Is
 
 Operational memory engine for AI agents. Captures sessions from Claude Code, Codex CLI, and Gemini CLI into a SurrealDB graph database with full provenance. Supports BM25, semantic vector search, hybrid search, working memory distillation, LLM-powered Q&A, and agentic multi-hop reasoning via DSPy RLM.
@@ -31,7 +33,7 @@ uc memory inject --project .
 # Admin-only commands
 uc admin --help
 uc admin search "query"
-uc admin reason "question" --verbose
+uc admin reason "question" --verbose   # legacy deep entrypoint (prefer `uc ask --deep`)
 uc admin context --project . --branch main --json
 uc admin share export run:abc123 -o bundle.json
 uc admin share import bundle.json --project .
@@ -88,7 +90,7 @@ universal_context/
 ├── tui/                    # Textual dashboard (Overview, Timeline, Search tabs)
 └── models/types.py         # Pydantic domain models + StrEnum types
 
-tests/                      # 341 tests
+tests/                      # 382 tests
 ├── test_git.py             # Git URL normalization, canonical_id, branch, cross-worktree, is_ancestor
 ├── test_reason.py          # RLM integration: AsyncBridge, LocalInterpreter, tools, LM config
 ├── test_db.py              # Schema, queries, search
