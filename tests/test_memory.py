@@ -22,6 +22,7 @@ from universal_context.db.queries import (
     get_scope_summaries_for_distillation,
     get_working_memory,
     get_working_memory_history,
+    set_working_memory_reasoning_metadata,
     upsert_working_memory,
 )
 from universal_context.db.schema import apply_schema
@@ -130,6 +131,30 @@ class TestWorkingMemoryQueries:
 
         history = await get_working_memory_history(db, scope_id, limit=3)
         assert len(history) == 3
+
+    async def test_set_reasoning_metadata_on_latest_memory(self, db: UCDatabase):
+        scope = await create_scope(db, "proj", "/tmp/proj")
+        scope_id = str(scope["id"])
+        await upsert_working_memory(db, scope_id, "v1")
+
+        updated_id = await set_working_memory_reasoning_metadata(
+            db,
+            scope_id,
+            {
+                "facts": ["Fact 1"],
+                "decisions": ["Decision 1"],
+                "open_questions": [],
+                "evidence_ids": ["artifact:abc123"],
+            },
+        )
+        assert updated_id is not None
+
+        memory = await get_working_memory(db, scope_id)
+        assert memory is not None
+        last = memory.get("metadata", {}).get("last_reasoning", {})
+        assert last.get("facts") == ["Fact 1"]
+        assert last.get("decisions") == ["Decision 1"]
+        assert last.get("evidence_ids") == ["artifact:abc123"]
 
     async def test_get_scope_summaries_for_distillation(self, db: UCDatabase):
         scope_id, run_id = await _setup_scope_with_turns(db, n_turns=3)

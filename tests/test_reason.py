@@ -11,10 +11,13 @@ from universal_context.reason import (
     _WRITE_PATTERN,
     AsyncBridge,
     LocalInterpreter,
+    _extract_record_ids,
     _FinalOutput,
     _format_query_results,
+    _normalize_reasoning_output,
     _SubmitError,
     build_tools,
+    resolve_reason_llm_target,
 )
 
 # ============================================================
@@ -279,6 +282,59 @@ class TestFormatQueryResults:
 
 
 # ============================================================
+# Structured reasoning output normalization
+# ============================================================
+
+
+class TestNormalizeReasoningOutput:
+    def test_normalizes_dict_payload(self):
+        out = _normalize_reasoning_output(
+            {
+                "answer": "Used artifact:abc123 for evidence.",
+                "facts": ["Scope resolved to scope:deadbeef"],
+                "decisions": ["Keep ask --deep as primary entrypoint"],
+                "open_questions": ["Should we persist full trajectories?"],
+                "evidence_ids": ["artifact:abc123", "scope:deadbeef"],
+            }
+        )
+        assert out["answer"].startswith("Used artifact:abc123")
+        assert "artifact:abc123" in out["evidence_ids"]
+        assert "scope:deadbeef" in out["evidence_ids"]
+        assert out["facts"] == ["Scope resolved to scope:deadbeef"]
+
+    def test_extracts_submit_payload_from_text(self):
+        raw = """
+        ```python
+        SUBMIT({
+          "answer": "Final answer using run:abcd1234",
+          "facts": ["Observed artifact:feedbeef"],
+          "decisions": [],
+          "open_questions": [],
+          "evidence_ids": ["run:abcd1234"]
+        })
+        ```
+        """
+        out = _normalize_reasoning_output(raw)
+        assert "Final answer" in out["answer"]
+        assert "run:abcd1234" in out["evidence_ids"]
+        assert "artifact:feedbeef" in out["evidence_ids"]
+
+    def test_fallback_for_plain_text(self):
+        out = _normalize_reasoning_output("No structured payload, but saw turn:abc123")
+        assert out["answer"].startswith("No structured payload")
+        assert out["facts"] == []
+        assert out["decisions"] == []
+        assert "turn:abc123" in out["evidence_ids"]
+
+
+class TestExtractRecordIds:
+    def test_dedupes_and_extracts_supported_ids(self):
+        text = "artifact:aaa111 run:bbb222 artifact:aaa111 scope:ccc333"
+        ids = _extract_record_ids(text)
+        assert ids == ["artifact:aaa111", "run:bbb222", "scope:ccc333"]
+
+
+# ============================================================
 # Build tools (with real DB)
 # ============================================================
 
@@ -505,6 +561,50 @@ class TestBuildDspyLm:
             model_arg = mock_lm.call_args[0][0]
             assert "openrouter/" in model_arg
             assert "claude-haiku" in model_arg
+
+
+class TestResolveReasonLlmTarget:
+    def test_openrouter_model_prefix_is_normalized(self):
+        from universal_context.config import UCConfig
+
+        provider, model, key = resolve_reason_llm_target(
+            UCConfig(
+                llm_provider="openrouter",
+                llm_model="openrouter/x-ai/grok-4.1-fast",
+                openrouter_api_key="or-key",
+            )
+        )
+        assert provider == "openrouter"
+        assert model == "openrouter/x-ai/grok-4.1-fast"
+        assert key == "or-key"
+
+    def test_claude_model_prefix_is_normalized(self):
+        from universal_context.config import UCConfig
+
+        provider, model, key = resolve_reason_llm_target(
+            UCConfig(
+                llm_provider="claude",
+                llm_model="anthropic/claude-sonnet-4-5-20250929",
+                anthropic_api_key="ant-key",
+            )
+        )
+        assert provider == "claude"
+        assert model == "anthropic/claude-sonnet-4-5-20250929"
+        assert key == "ant-key"
+
+    def test_openai_model_prefix_is_normalized(self):
+        from universal_context.config import UCConfig
+
+        provider, model, key = resolve_reason_llm_target(
+            UCConfig(
+                llm_provider="openai",
+                llm_model="openai/gpt-4.1-mini",
+                openai_api_key="oa-key",
+            )
+        )
+        assert provider == "openai"
+        assert model == "openai/gpt-4.1-mini"
+        assert key == "oa-key"
 
 
 # ============================================================

@@ -1,4 +1,4 @@
-"""Tests for CLI JSON output mode and the uc context command."""
+"""Tests for CLI JSON output mode and shared record sanitization helpers."""
 
 from __future__ import annotations
 

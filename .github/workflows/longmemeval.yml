@@ -1,0 +1,41 @@
+name: LongMemEval
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  longmemeval:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install project
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,llm]"
+
+      - name: Run LongMemEval
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          python eval/run_longmemeval.py \
+            --provider openrouter \
+            --model x-ai/grok-4.1-fast \
+            --max-questions 10 \
+            --allow-skip \
+            --install-requirements \
+            --json-out eval/longmemeval_latest.json
+
+      - name: Upload LongMemEval report
+        uses: actions/upload-artifact@v4
+        with:
+          name: longmemeval-report
+          path: eval/longmemeval_latest.json

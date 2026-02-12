@@ -1,15 +1,18 @@
 """RLM (Recursive Language Model) integration for agentic memory exploration.
 
-Provides `uc reason` — tier 6 retrieval where the LLM programs its own
-exploration of UC's graph database via a sandboxed REPL loop. Uses DSPy's
-RLM module with a custom in-process Python interpreter and UC-specific tools.
+Provides the deep reasoning backend for `uc ask --deep` (and `uc admin reason`)
+where the LLM programs its own exploration of UC's graph database via a
+sandboxed REPL loop. Uses DSPy's RLM module with a custom in-process Python
+interpreter and UC-specific tools.
 
 Requires: ``pip install universal-context[reason]`` (installs DSPy)
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import json
 import logging
 import re
 from io import StringIO
@@ -190,21 +193,15 @@ class LocalInterpreter:
 # ============================================================
 
 
-def build_dspy_lm(config: UCConfig) -> Any:
-    """Build a ``dspy.LM`` instance from UC config.
-
-    Maps UC's provider/model/key config to DSPy's LM wrapper,
-    which uses LiteLLM under the hood for routing.
-    """
-    import dspy
-
-    provider = config.llm_provider
-    model = config.llm_model
+def resolve_reason_llm_target(config: UCConfig) -> tuple[str, str, str]:
+    """Resolve provider/model/key for DSPy RLM from UC config."""
+    provider = (config.llm_provider or "auto").strip().lower()
+    raw_model = (config.llm_model or "").strip()
 
     if provider == "auto":
-        for p in ("openrouter", "claude", "openai"):
-            if config.get_api_key(p):
-                provider = p
+        for candidate in ("openrouter", "claude", "openai"):
+            if config.get_api_key(candidate):
+                provider = candidate
                 break
         else:
             raise ValueError("No LLM API key configured for any provider")
@@ -213,22 +210,46 @@ def build_dspy_lm(config: UCConfig) -> Any:
     if not api_key:
         raise ValueError(f"No API key for provider '{provider}'")
 
-    _defaults = {
+    defaults = {
         "openrouter": "anthropic/claude-haiku-4-5-20251001",
         "claude": "claude-haiku-4-5-20251001",
         "openai": "gpt-4.1-mini",
     }
 
     if provider == "openrouter":
-        lm_model = f"openrouter/{model}" if model else f"openrouter/{_defaults['openrouter']}"
-        return dspy.LM(lm_model, api_key=api_key, api_base="https://openrouter.ai/api/v1")
+        model = raw_model or defaults["openrouter"]
+        if model.startswith("openrouter/"):
+            model = model.removeprefix("openrouter/")
+        return provider, f"openrouter/{model}", api_key
 
     if provider == "claude":
-        lm_model = f"anthropic/{model}" if model else f"anthropic/{_defaults['claude']}"
-        return dspy.LM(lm_model, api_key=api_key)
+        model = raw_model or defaults["claude"]
+        if model.startswith("anthropic/"):
+            model = model.removeprefix("anthropic/")
+        return provider, f"anthropic/{model}", api_key
 
     if provider == "openai":
-        lm_model = f"openai/{model}" if model else f"openai/{_defaults['openai']}"
+        model = raw_model or defaults["openai"]
+        if model.startswith("openai/"):
+            model = model.removeprefix("openai/")
+        return provider, f"openai/{model}", api_key
+
+    raise ValueError(f"Unsupported LLM provider: {provider}")
+
+
+def build_dspy_lm(
+    config: UCConfig,
+    resolved: tuple[str, str, str] | None = None,
+) -> Any:
+    """Build a ``dspy.LM`` instance from UC config."""
+    import dspy
+
+    provider, lm_model, api_key = resolved or resolve_reason_llm_target(config)
+
+    if provider == "openrouter":
+        return dspy.LM(lm_model, api_key=api_key, api_base="https://openrouter.ai/api/v1")
+
+    if provider in {"claude", "openai"}:
         return dspy.LM(lm_model, api_key=api_key)
 
     raise ValueError(f"Unsupported LLM provider: {provider}")
@@ -243,6 +264,145 @@ _WRITE_PATTERN = re.compile(
     r"\b(CREATE|UPDATE|DELETE|RELATE|DEFINE|REMOVE|INSERT|UPSERT)\b",
     re.IGNORECASE,
 )
+_RECORD_ID_PATTERN = re.compile(r"\b(?:scope|run|turn|artifact):[a-z0-9]{3,}\b", re.IGNORECASE)
+
+
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, list):
+        out: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    out.append(text)
+            elif item is not None:
+                text = str(item).strip()
+                if text:
+                    out.append(text)
+        return out
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _extract_record_ids(text: str) -> list[str]:
+    if not text:
+        return []
+    return _dedupe_keep_order([m.group(0) for m in _RECORD_ID_PATTERN.finditer(text)])
+
+
+def _parse_obj_literal(raw: str) -> Any:
+    """Parse a JSON/Python object literal. Returns raw string on failure."""
+    raw = raw.strip()
+    if not raw:
+        return raw
+
+    # JSON first (strict), then Python literal fallback
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    try:
+        return ast.literal_eval(raw)
+    except Exception:
+        return raw
+
+
+def _extract_submit_arg(text: str) -> str | None:
+    """Extract the first SUBMIT(...) argument from a text blob, if present."""
+    marker = "SUBMIT("
+    start = text.find(marker)
+    if start < 0:
+        return None
+
+    i = start + len(marker)
+    depth = 1
+    arg_start = i
+    while i < len(text):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[arg_start:i].strip()
+        i += 1
+    return None
+
+
+def _normalize_reasoning_output(raw_output: Any) -> dict[str, Any]:
+    """Normalize RLM output into a typed contract.
+
+    Output contract:
+      - answer: str
+      - facts: list[str]
+      - decisions: list[str]
+      - open_questions: list[str]
+      - evidence_ids: list[str]
+    """
+    parsed: Any = raw_output
+
+    if isinstance(raw_output, str):
+        submit_arg = _extract_submit_arg(raw_output)
+        if submit_arg:
+            parsed = _parse_obj_literal(submit_arg)
+        elif raw_output.strip().startswith("{"):
+            parsed = _parse_obj_literal(raw_output)
+
+    answer = ""
+    facts: list[str] = []
+    decisions: list[str] = []
+    open_questions: list[str] = []
+    evidence_ids: list[str] = []
+
+    if isinstance(parsed, dict):
+        answer = str(
+            parsed.get("answer")
+            or parsed.get("summary")
+            or parsed.get("response")
+            or ""
+        ).strip()
+        facts = _as_string_list(parsed.get("facts"))
+        decisions = _as_string_list(parsed.get("decisions"))
+        open_questions = _as_string_list(
+            parsed.get("open_questions") or parsed.get("questions"),
+        )
+        evidence_ids = _as_string_list(
+            parsed.get("evidence_ids")
+            or parsed.get("evidence")
+            or parsed.get("sources"),
+        )
+    else:
+        answer = str(parsed).strip()
+
+    text_sources = [answer, *facts, *decisions, *open_questions]
+    for src in text_sources:
+        evidence_ids.extend(_extract_record_ids(src))
+
+    evidence_ids = _dedupe_keep_order(evidence_ids)
+
+    return {
+        "answer": answer,
+        "facts": _dedupe_keep_order(facts),
+        "decisions": _dedupe_keep_order(decisions),
+        "open_questions": _dedupe_keep_order(open_questions),
+        "evidence_ids": evidence_ids,
+    }
 
 
 def build_tools(
@@ -463,9 +623,17 @@ IMPORTANT:
 - Always start with get_working_memory() for project context
 - Search broadly first, then drill into specific runs/turns
 - query_graph() only accepts SELECT statements (no writes)
-- When you have enough information, call SUBMIT({"answer": your_markdown_answer})
-  The argument to SUBMIT MUST be a dict with an "answer" key.
-- Use markdown formatting in your answer
+- When you have enough information, call:
+  SUBMIT({
+    "answer": "...markdown...",
+    "facts": ["..."],
+    "decisions": ["..."],
+    "open_questions": ["..."],
+    "evidence_ids": ["artifact:...", "run:..."]
+  })
+- `evidence_ids` should contain concrete UC IDs you used as evidence
+- Keep `facts/decisions/open_questions` concise and atomic
+- Use markdown formatting in `answer`
 - Be specific — cite run IDs, turn numbers, and file names when possible
 """
 
@@ -483,11 +651,15 @@ async def reason(
     The LLM explores the project's history through a REPL loop,
     using tools to search, navigate, and query the graph database.
 
-    Returns dict with keys: answer, trajectory, iterations, scope.
+    Returns dict with keys:
+      answer, facts, decisions, open_questions, evidence_ids,
+      trajectory, iterations, scope, llm_provider, llm_model
     """
     import dspy
 
-    lm = build_dspy_lm(config)
+    resolved_llm = resolve_reason_llm_target(config)
+    lm_provider, lm_model, _ = resolved_llm
+    lm = build_dspy_lm(config, resolved=resolved_llm)
     dspy.configure(lm=lm)
 
     from pathlib import Path
@@ -543,11 +715,22 @@ async def reason(
             project_context=project_context,
         )
 
+        trajectory = getattr(result, "trajectory", [])
+        structured = _normalize_reasoning_output(result.answer)
+
+        # Evidence IDs may also appear in tool outputs captured in the trajectory.
+        if trajectory:
+            trajectory_text = str(trajectory)
+            merged_ids = structured["evidence_ids"] + _extract_record_ids(trajectory_text)
+            structured["evidence_ids"] = _dedupe_keep_order(merged_ids)
+
         return {
-            "answer": result.answer,
-            "trajectory": getattr(result, "trajectory", []),
+            **structured,
+            "trajectory": trajectory,
             "iterations": getattr(result, "iterations", None),
             "scope": scope_id,
+            "llm_provider": lm_provider,
+            "llm_model": lm_model,
         }
     finally:
         bridge.shutdown()

@@ -76,7 +76,7 @@ should be integrated, not appended.
 - "In progress" last time + done in new summaries → DELETE from Active Threads entirely
 - "Added feature X" is NOT worth keeping once X is established — only if there's a gotcha
 - Do NOT narrate history. This is a state snapshot, not a changelog
-- When in doubt, cut. The agent can always query `uc context` for details
+- When in doubt, cut. The agent can always query `uc find`/`uc ask` for details
 """
 
 

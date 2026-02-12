@@ -984,6 +984,28 @@ async def get_working_memory_history(
     )
 
 
+async def set_working_memory_reasoning_metadata(
+    db: UCDatabase,
+    scope_id: str,
+    reasoning: dict[str, Any],
+) -> str | None:
+    """Attach latest deep-reasoning snapshot metadata to current working memory.
+
+    Returns the working memory artifact ID if updated, otherwise None.
+    """
+    memory = await get_working_memory(db, scope_id)
+    if not memory:
+        return None
+
+    mid = str(memory["id"])
+    await db.query(
+        f"UPDATE {mid} SET metadata.last_reasoning = $reasoning, "
+        "metadata.last_reasoning_at = time::now()",
+        {"reasoning": reasoning},
+    )
+    return mid
+
+
 async def get_scope_summaries_for_distillation(
     db: UCDatabase,
     scope_id: str,

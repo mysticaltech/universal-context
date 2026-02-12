@@ -15,6 +15,7 @@ venv/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+.cache/
 
 # IDE
 .vscode/
@@ -27,6 +28,8 @@ venv/
 history.txt
 tasks/
 nanobanana-output/
+eval/*_latest.json
+eval/*_latest.jsonl
 
 # Lock files
 uv.lock

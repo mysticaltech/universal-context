@@ -237,7 +237,7 @@ auto_detect_gemini: true
 | `openai` | `OPENAI_API_KEY` | Direct OpenAI API |
 | `auto` | Any of the above | Tries providers in priority order |
 
-> **Recommended model:** Set `llm_model: "xai/grok-4.1-fast"` via OpenRouter. Fast, cheap, excellent at summarization. The default (Claude Haiku 4.5) works great too.
+> **Recommended model:** Set `llm_model: "x-ai/grok-4.1-fast"` via OpenRouter. Fast, cheap, excellent at summarization. The default (Claude Haiku 4.5) works great too.
 
 ### Embedding Providers
 
@@ -253,18 +253,18 @@ The local model downloads ~600MB on first use and caches at `~/.cache/uc-models/
 ## CLI Reference
 
 <details>
-<summary><strong>Search & Context</strong></summary>
+<summary><strong>Public Commands (Default UX)</strong></summary>
 
 ```bash
-uc search "query"                          # Keyword search (BM25)
-uc search "query" --semantic               # Semantic vector search
-uc search "query" --hybrid                 # Hybrid (keyword + semantic)
-uc search "query" --project .              # Scoped to current project
-uc context --json --context "task desc"    # Get relevant context for a task
-uc context --project . --branch main       # Branch-filtered context
-uc ask "question" --project .              # LLM-powered Q&A
-uc reason "question" --project .          # Agentic multi-hop reasoning (DSPy RLM)
-uc reason "question" --project . -v       # Show REPL trajectory
+uc "what changed in scope identity?"       # Intent-first: routes to `uc ask`
+uc ask "question" --project .              # Shallow Q&A
+uc ask "question" --project . --deep       # Agentic deep reasoning (DSPy RLM)
+uc find "query" --project .                # Unified retrieval (auto mode)
+uc find "query" --mode keyword             # BM25/substring retrieval
+uc find "query" --mode semantic            # Vector retrieval
+uc find "query" --mode hybrid              # Hybrid retrieval
+uc status                                  # System overview
+uc doctor                                  # Health check
 ```
 
 </details>
@@ -275,6 +275,7 @@ uc reason "question" --project . -v       # Show REPL trajectory
 ```bash
 uc memory show --project .                 # View distilled project memory
 uc memory refresh --project .              # Regenerate from latest sessions
+uc memory sync --project .                 # Refresh + inject (single command)
 uc memory inject --project .               # Write into AGENTS.md
 uc memory inject -t CLAUDE.md              # Write into CLAUDE.md
 uc memory eject --project .                # Remove injected memory
@@ -284,45 +285,55 @@ uc memory history --project .              # View memory versions
 </details>
 
 <details>
-<summary><strong>Daemon & Status</strong></summary>
+<summary><strong>Daemon</strong></summary>
 
 ```bash
 uc daemon start                            # Start in background
 uc daemon start -f                         # Start in foreground (see logs)
 uc daemon stop                             # Stop the daemon
-uc status                                  # System overview
-uc doctor                                  # Health check
 ```
 
 </details>
 
 <details>
-<summary><strong>Inspect & Timeline</strong></summary>
+<summary><strong>Admin Commands (Operator UX)</strong></summary>
 
 ```bash
-uc timeline                                # Turns in latest run
-uc timeline --branch main                  # Filter by branch
-uc inspect turn:abc123                     # Full provenance chain for a turn
-uc dashboard                               # Interactive TUI
-```
-
-</details>
-
-<details>
-<summary><strong>Sharing & Scopes</strong></summary>
-
-```bash
-uc share export run:abc123 -o bundle.json  # Export a run as v2 bundle
-uc share import bundle.json --project .    # Import into current project scope
-uc scope list --json                       # List all scopes
-uc scope show <ref>                        # Show scope details
-uc scope cleanup --dry-run                 # Find orphaned scopes
-uc rebuild-index                           # Rebuild HNSW vector index
+uc admin --help                             # Full operator surface
+uc admin search "query"                     # Legacy direct search command
+uc admin context --project . --branch main  # Run/branch context views
+uc admin reason "question" -v               # Legacy deep-reasoning command
+uc admin timeline --branch main             # Inspect run timelines
+uc admin inspect turn:abc123                # Inspect provenance for a turn
+uc admin share export run:abc123 -o bundle.json
+uc admin share import bundle.json --project .
+uc admin scope list --json
+uc admin rebuild-index
+uc admin dashboard
 ```
 
 </details>
 
 > Every command supports `--json` for machine-readable output.
+> Alpha reset note: command surface is intentionally breaking while UX is being simplified.
+
+---
+
+## Evaluation
+
+```bash
+# PR gate (deterministic smoke eval)
+python3 eval/run_uc_smoke.py --json-out eval/uc_smoke_latest.json
+
+# Scheduled calibration (LongMemEval)
+python3 eval/run_longmemeval.py \
+  --provider openrouter \
+  --model x-ai/grok-4.1-fast \
+  --max-questions 10 \
+  --allow-skip \
+  --install-requirements \
+  --json-out eval/longmemeval_latest.json
+```
 
 ---
 

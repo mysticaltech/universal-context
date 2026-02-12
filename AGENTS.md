@@ -4,6 +4,8 @@
 
 Operational memory engine for AI agents. Captures sessions from Claude Code, Codex CLI, and Gemini CLI into a SurrealDB graph database with full provenance. Supports BM25, semantic vector search, hybrid search, working memory distillation, LLM-powered Q&A, and agentic multi-hop reasoning via DSPy RLM.
 
+> Alpha reset policy (2026-02-12): CLI surface is intentionally breaking while UX is simplified. No backward compatibility guarantees yet.
+
 ## Quick Reference
 
 ```bash
@@ -12,30 +14,31 @@ uv pip install -e ".[dev,llm]"
 
 # CLI
 uc --help
-uc init
 uc doctor
 uc status
-uc search "query" --project .
+uc "question about project memory"
+uc find "query" --project .
 uc ask "question" --project .
-uc reason "question" --project .
-uc reason "question" --project . --verbose
-uc context --json --context "task description"
-uc context --project . --branch main --json
-uc rebuild-index
-uc timeline
-uc timeline --branch main
-uc inspect turn:abc123
+uc ask "question" --project . --deep
 uc daemon start -f
-uc dashboard
+uc memory sync --project .
 
 # Working memory
 uc memory show --project .
 uc memory refresh --project .
 uc memory inject --project .
 
-# Sharing
-uc share export run:abc123 -o bundle.json
-uc share import bundle.json --project .
+# Admin-only commands
+uc admin --help
+uc admin search "query"
+uc admin reason "question" --verbose
+uc admin context --project . --branch main --json
+uc admin share export run:abc123 -o bundle.json
+uc admin share import bundle.json --project .
+uc admin scope list --json
+uc admin rebuild-index
+uc admin timeline --branch main
+uc admin inspect turn:abc123
 
 # Test & lint
 pytest
@@ -61,7 +64,7 @@ ruff format .
 
 ```
 universal_context/
-├── cli.py                  # Typer CLI (search, ask, reason, context, timeline, inspect, daemon, memory)
+├── cli.py                  # Typer CLI (public surface + `admin` operator namespace)
 ├── config.py               # UCConfig dataclass, YAML load/save
 ├── embed.py                # EmbedProvider ABC + Local (EmbeddingGemma/ONNX) + OpenAI
 ├── git.py                  # Git-aware scope identity (canonical_id, branch, commit_sha, is_ancestor)
@@ -148,7 +151,7 @@ tests/                      # 341 tests
 
 - **Build-once bug**: data inserted after `DEFINE INDEX ... HNSW` is invisible to KNN.
 - **Workaround**: `REMOVE INDEX` + `DEFINE INDEX` forces rebuild. `REBUILD INDEX` is broken.
-- **Mitigations**: `apply_schema()` catches HNSW creation failures (non-fatal). `semantic_search()` auto-falls back to brute-force cosine when HNSW returns 0 results. Worker auto-rebuilds HNSW after 25 new embeddings. `uc rebuild-index` available for manual rebuild.
+- **Mitigations**: `apply_schema()` catches HNSW creation failures (non-fatal). `semantic_search()` auto-falls back to brute-force cosine when HNSW returns 0 results. Worker auto-rebuilds HNSW after 25 new embeddings. `uc admin rebuild-index` available for manual rebuild.
 - **Data corruption**: HNSW index files can go missing on disk (`IO error: No such file or directory`). `REMOVE INDEX` succeeds but `DEFINE INDEX` fails until server restart with fresh data path. Tracked upstream.
 
 ### Schema Split

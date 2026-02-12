@@ -1,0 +1,31 @@
+[
+  {
+    "name": "keyword_auth",
+    "mode": "keyword",
+    "scope": "alpha",
+    "query": "JWT auth",
+    "expected_label": "auth_summary"
+  },
+  {
+    "name": "semantic_auth",
+    "mode": "semantic",
+    "scope": "alpha",
+    "query_embedding": [0.95, 0.1, 0.0],
+    "expected_label": "auth_summary"
+  },
+  {
+    "name": "hybrid_db",
+    "mode": "hybrid",
+    "scope": "alpha",
+    "query": "Where was schema migration implemented?",
+    "query_embedding": [0.0, 1.0, 0.0],
+    "expected_label": "db_summary"
+  },
+  {
+    "name": "scope_isolation",
+    "mode": "keyword",
+    "scope": "beta",
+    "query": "JWT auth",
+    "expected_count": 0
+  }
+]

@@ -15,7 +15,35 @@ from rich.table import Table
 
 from . import __version__, get_uc_home
 
-app = typer.Typer(
+
+class UCApp(typer.Typer):
+    """Typer app with intent-first routing: `uc \"question\"` -> `uc ask \"question\"`."""
+
+    _DIRECT_COMMANDS = {
+        "doctor",
+        "status",
+        "find",
+        "ask",
+        "daemon",
+        "memory",
+        "admin",
+    }
+
+    def __call__(self, *args, **kwargs):
+        import sys
+
+        argv = sys.argv[1:]
+        if argv and argv[0] not in self._DIRECT_COMMANDS and not argv[0].startswith("-"):
+            original_argv = sys.argv[:]
+            sys.argv = [sys.argv[0], "ask", *argv]
+            try:
+                return super().__call__(*args, **kwargs)
+            finally:
+                sys.argv = original_argv
+        return super().__call__(*args, **kwargs)
+
+
+app = UCApp(
     name="uc",
     help="Universal Context — operational memory engine for AI agents",
     add_completion=False,
@@ -28,20 +56,20 @@ console = Console()
 daemon_app = typer.Typer(help="Manage the UC daemon (watcher + worker)")
 app.add_typer(daemon_app, name="daemon")
 
-checkpoint_app = typer.Typer(help="Create, list, and restore checkpoints")
-app.add_typer(checkpoint_app, name="checkpoint")
-
-share_app = typer.Typer(help="Export and import share bundles")
-app.add_typer(share_app, name="share")
-
-config_app = typer.Typer(help="View and modify configuration")
-app.add_typer(config_app, name="config")
-
-scope_app = typer.Typer(help="Manage project scopes")
-app.add_typer(scope_app, name="scope")
-
 memory_app = typer.Typer(help="Project working memory")
 app.add_typer(memory_app, name="memory")
+
+admin_app = typer.Typer(help="Advanced and operator-focused commands")
+app.add_typer(admin_app, name="admin")
+
+share_app = typer.Typer(help="Export and import share bundles")
+admin_app.add_typer(share_app, name="share")
+
+config_app = typer.Typer(help="View and modify configuration")
+admin_app.add_typer(config_app, name="config")
+
+scope_app = typer.Typer(help="Manage project scopes")
+admin_app.add_typer(scope_app, name="scope")
 
 
 # --- Async helper ---
@@ -88,6 +116,13 @@ def _sanitize_record(record: dict[str, Any]) -> dict[str, Any]:
     return sanitized
 
 
+def _sanitize_search_result(record: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize artifact/search records and drop heavy vector payloads."""
+    sanitized = _sanitize_record(record)
+    sanitized.pop("embedding", None)
+    return sanitized
+
+
 # --- Top-level commands ---
 
 
@@ -96,10 +131,11 @@ def main(ctx: typer.Context) -> None:
     """UC — operational memory for AI agents."""
     if ctx.invoked_subcommand is None:
         console.print(f"[bold]Universal Context[/bold] v{__version__}")
+        console.print('Ask directly: [cyan]uc "why did we choose SurrealDB?"[/cyan]')
         console.print("Run [cyan]uc --help[/cyan] for available commands.")
 
 
-@app.command()
+@admin_app.command("init")
 def init() -> None:
     """Set up UC home directory (~/.uc/) and default config."""
     from .config import get_default_config_content
@@ -119,7 +155,7 @@ def init() -> None:
     console.print(f"[green]UC home ready:[/green] {uc_home}")
 
 
-@app.command()
+@admin_app.command("version")
 def version() -> None:
     """Show version information."""
     console.print(f"Universal Context v{__version__}")
@@ -172,7 +208,7 @@ def doctor() -> None:
         console.print("  [dim]Daemon: not running[/dim]")
 
 
-@app.command()
+@admin_app.command("search")
 def search(
     query: str = typer.Argument(..., help="Search query"),
     project: Path | None = typer.Option(
@@ -209,7 +245,7 @@ def search(
             )
 
             if json_output:
-                sanitized = [_sanitize_record(r) for r in results]
+                sanitized = [_sanitize_search_result(r) for r in results]
                 print(json_mod.dumps(sanitized, default=str))
                 return
 
@@ -231,7 +267,7 @@ def search(
     _run_async(_search())
 
 
-@app.command()
+@admin_app.command("timeline")
 def timeline(
     run_id: str | None = typer.Argument(None, help="Run ID (omit for latest)"),
     project: Path | None = typer.Option(
@@ -312,7 +348,7 @@ def timeline(
     _run_async(_timeline())
 
 
-@app.command()
+@admin_app.command("inspect")
 def inspect(
     turn_id: str = typer.Argument(..., help="Turn ID to inspect"),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
@@ -434,7 +470,7 @@ def status(
     _run_async(_status())
 
 
-@app.command()
+@admin_app.command("context")
 def context(
     project: Path | None = typer.Option(
         None, "--project", "-p", help="Project path (default: cwd)"
@@ -635,9 +671,238 @@ async def _semantic_search(
                 scope_id=scope_id,
             )
 
-        return [_sanitize_record(r) for r in results]
+        return [_sanitize_search_result(r) for r in results]
     except Exception as e:
         return [{"error": "embed_failed", "message": str(e)}]
+
+
+@app.command()
+def find(
+    text: str = typer.Argument(..., help="Search text or semantic context"),
+    mode: str = typer.Option(
+        "auto",
+        "--mode",
+        "-m",
+        help="Search mode: auto, keyword, semantic, hybrid",
+    ),
+    project: Path | None = typer.Option(
+        None, "--project", "-p", help="Scope search to a project path"
+    ),
+    kind: str | None = typer.Option(None, "--kind", "-k", help="Filter by artifact kind"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Unified retrieval command for keyword and semantic memory search."""
+
+    async def _find():
+        from .db.queries import search_artifacts
+        from .db.schema import apply_schema
+
+        normalized_mode = mode.strip().lower()
+        valid_modes = {"auto", "keyword", "semantic", "hybrid"}
+        if normalized_mode not in valid_modes:
+            console.print(
+                f"[red]Invalid mode:[/red] {mode}. "
+                f"Use one of: {', '.join(sorted(valid_modes))}"
+            )
+            raise typer.Exit(code=1)
+
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+
+            scope_id = None
+            if project is not None:
+                project_path = str(project.resolve())
+                scope = await _resolve_scope(db, project_path)
+                if scope:
+                    scope_id = str(scope["id"])
+
+            keyword_results: list[dict[str, Any]] = []
+            semantic_results: list[dict[str, Any]] = []
+
+            if normalized_mode in {"auto", "keyword", "hybrid"}:
+                raw_keyword = await search_artifacts(
+                    db,
+                    text,
+                    kind=kind,
+                    limit=limit,
+                    scope_id=scope_id,
+                )
+                keyword_results = [_sanitize_search_result(r) for r in raw_keyword]
+
+            if normalized_mode in {"auto", "semantic", "hybrid"}:
+                semantic_query = text if normalized_mode == "hybrid" else None
+                semantic_results = await _semantic_search(
+                    db,
+                    text,
+                    keyword_query=semantic_query,
+                    scope_id=scope_id,
+                )
+
+            valid_semantic = [r for r in semantic_results if "error" not in r]
+            semantic_errors = [r for r in semantic_results if "error" in r]
+
+            if normalized_mode == "keyword":
+                primary_results = keyword_results
+            elif normalized_mode in {"semantic", "hybrid"}:
+                primary_results = valid_semantic
+            else:
+                primary_results = valid_semantic if valid_semantic else keyword_results
+
+            if json_output:
+                print(
+                    json_mod.dumps(
+                        {
+                            "query": text,
+                            "mode": normalized_mode,
+                            "scope": scope_id,
+                            "results": primary_results,
+                            "keyword_results": keyword_results,
+                            "semantic_results": valid_semantic,
+                            "semantic_errors": semantic_errors,
+                        },
+                        default=str,
+                    )
+                )
+                return
+
+            if not primary_results:
+                console.print("[dim]No results found.[/dim]")
+                if semantic_errors:
+                    console.print(f"[dim]Semantic issue: {semantic_errors[0].get('message')}[/dim]")
+                return
+
+            table = Table(title=f"Find ({normalized_mode}): {text}")
+            table.add_column("ID", style="cyan")
+            table.add_column("Kind", style="green")
+            table.add_column("Score", style="yellow", justify="right")
+            table.add_column("Content", max_width=70)
+            for r in primary_results[:limit]:
+                content = (r.get("content") or "")[:70]
+                score = r.get("score")
+                score_text = f"{score:.3f}" if isinstance(score, float) else "-"
+                table.add_row(str(r.get("id", "")), r.get("kind", ""), score_text, content)
+            console.print(table)
+        finally:
+            await db.close()
+
+    _run_async(_find())
+
+
+async def _run_reasoning(
+    question: str,
+    project_path: str,
+    max_iterations: int,
+    max_llm_calls: int,
+    verbose: bool,
+) -> dict[str, Any]:
+    from .config import UCConfig
+    from .reason import reason as run_reason
+
+    config = UCConfig.load()
+    return await run_reason(
+        question=question,
+        project_path=project_path,
+        config=config,
+        max_iterations=max_iterations,
+        max_llm_calls=max_llm_calls,
+        verbose=verbose,
+    )
+
+
+async def _persist_reasoning_snapshot(
+    project_path: str,
+    result: dict[str, Any],
+) -> str | None:
+    """Persist deep-reasoning structured fields onto working-memory metadata."""
+    from .db.queries import set_working_memory_reasoning_metadata
+    from .db.schema import apply_schema
+
+    db = _get_db()
+    await db.connect()
+    try:
+        await apply_schema(db)
+        scope = await _resolve_scope(db, project_path)
+        if not scope:
+            return None
+
+        scope_id = str(scope["id"])
+        reasoning = {
+            "answer_preview": (result.get("answer") or "")[:500],
+            "facts": result.get("facts", []),
+            "decisions": result.get("decisions", []),
+            "open_questions": result.get("open_questions", []),
+            "evidence_ids": result.get("evidence_ids", []),
+        }
+        return await set_working_memory_reasoning_metadata(db, scope_id, reasoning)
+    finally:
+        await db.close()
+
+
+def _render_reason_output(result: dict[str, Any], verbose: bool) -> None:
+    from rich.markdown import Markdown
+    from rich.panel import Panel
+
+    console.print(
+        Panel(
+            Markdown(result["answer"]),
+            title="Answer",
+            border_style="green",
+        )
+    )
+
+    llm_provider = result.get("llm_provider")
+    llm_model = result.get("llm_model")
+    if llm_provider and llm_model:
+        console.print(f"[dim]LLM: {llm_provider} ({llm_model})[/dim]")
+
+    facts = result.get("facts") or []
+    decisions = result.get("decisions") or []
+    open_questions = result.get("open_questions") or []
+    evidence_ids = result.get("evidence_ids") or []
+
+    if facts:
+        console.print("\n[bold]Facts[/bold]")
+        for item in facts:
+            console.print(f"- {item}")
+
+    if decisions:
+        console.print("\n[bold]Decisions[/bold]")
+        for item in decisions:
+            console.print(f"- {item}")
+
+    if open_questions:
+        console.print("\n[bold]Open Questions[/bold]")
+        for item in open_questions:
+            console.print(f"- {item}")
+
+    if evidence_ids:
+        console.print("\n[bold]Evidence IDs[/bold]")
+        for item in evidence_ids:
+            console.print(f"- [cyan]{item}[/cyan]")
+
+    if verbose and result.get("trajectory"):
+        console.print("\n[bold]Trajectory:[/bold]")
+        for i, step in enumerate(result["trajectory"], 1):
+            if isinstance(step, dict):
+                code = step.get("code", "")
+                output = step.get("output", "")
+                console.print(f"\n[cyan]Step {i}:[/cyan]")
+                if code:
+                    from rich.syntax import Syntax
+
+                    console.print(Syntax(str(code), "python", theme="monokai"))
+                if output:
+                    console.print(f"[dim]{str(output)[:500]}[/dim]")
+            else:
+                console.print(f"\n[cyan]Step {i}:[/cyan] {str(step)[:500]}")
+
+    scope_info = f"scope: {result.get('scope', 'none')}"
+    iterations = result.get("iterations")
+    iter_info = f"  iterations: {iterations}" if iterations else ""
+    console.print(f"\n[dim]{scope_info}{iter_info}[/dim]")
 
 
 @app.command()
@@ -647,9 +912,18 @@ def ask(
         None, "--project", "-p", help="Project path (default: cwd)"
     ),
     limit: int = typer.Option(10, "--limit", "-n", help="Max search results for context"),
+    deep: bool = typer.Option(False, "--deep", help="Use agentic deep reasoning"),
+    auto_deep: bool = typer.Option(
+        True,
+        "--auto-deep/--no-auto-deep",
+        help="Auto-escalate to deep reasoning when shallow context is missing",
+    ),
+    max_iterations: int = typer.Option(12, "--max-iterations", help="Max deep REPL iterations"),
+    max_llm_calls: int = typer.Option(30, "--max-llm-calls", help="Max deep LLM calls"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show deep reasoning trajectory"),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
 ) -> None:
-    """Ask a question about a project — answered by LLM using session context."""
+    """Ask a question about a project. Use --deep for agentic reasoning."""
 
     async def _ask():
         from .config import UCConfig
@@ -658,6 +932,31 @@ def ask(
         from .llm import ASK_SYSTEM_PROMPT, create_llm_fn
 
         project_path = str((project or Path(".")).resolve())
+
+        if deep:
+            if not json_output:
+                console.print("[dim]Reasoning... (this may take a moment)[/dim]")
+            result = await _run_reasoning(
+                question=question,
+                project_path=project_path,
+                max_iterations=max_iterations,
+                max_llm_calls=max_llm_calls,
+                verbose=verbose,
+            )
+            persisted_memory_id = await _persist_reasoning_snapshot(project_path, result)
+            if json_output:
+                payload = dict(result)
+                payload["mode"] = "deep"
+                payload["persisted_working_memory"] = persisted_memory_id
+                print(json_mod.dumps(payload, default=str))
+            else:
+                _render_reason_output(result, verbose=verbose)
+                if persisted_memory_id:
+                    console.print(
+                        f"[dim]Updated reasoning metadata on {persisted_memory_id}[/dim]"
+                    )
+            return
+
         config = UCConfig.load()
 
         db = _get_db()
@@ -667,7 +966,6 @@ def ask(
             scope = await _resolve_scope(db, project_path)
             scope_id = str(scope["id"]) if scope else None
 
-            # Gather context: working memory + search results
             context_parts: list[str] = []
 
             if scope_id:
@@ -675,7 +973,6 @@ def ask(
                 if memory and memory.get("content"):
                     context_parts.append(f"## Working Memory\n{memory['content']}")
 
-            # Keyword search for relevant artifacts
             search_results = await search_artifacts(
                 db,
                 question,
@@ -689,19 +986,43 @@ def ask(
                 )
                 context_parts.append(f"## Relevant Session Summaries\n{summaries_text}")
 
-            # Also try semantic search if embed provider available
             semantic_results = await _semantic_search(
                 db,
                 question,
                 scope_id=scope_id,
             )
-            # Filter out error dicts
             valid_semantic = [r for r in semantic_results if "error" not in r]
             if valid_semantic:
                 sem_text = "\n".join(f"- {r.get('content', '')[:500]}" for r in valid_semantic)
                 context_parts.append(f"## Semantic Matches\n{sem_text}")
 
             if not context_parts:
+                if auto_deep:
+                    if not json_output:
+                        console.print(
+                            "[dim]Shallow context missing. Escalating to deep reasoning...[/dim]"
+                        )
+                    result = await _run_reasoning(
+                        question=question,
+                        project_path=project_path,
+                        max_iterations=max_iterations,
+                        max_llm_calls=max_llm_calls,
+                        verbose=verbose,
+                    )
+                    persisted_memory_id = await _persist_reasoning_snapshot(project_path, result)
+                    if json_output:
+                        payload = dict(result)
+                        payload["mode"] = "deep_auto"
+                        payload["persisted_working_memory"] = persisted_memory_id
+                        print(json_mod.dumps(payload, default=str))
+                    else:
+                        _render_reason_output(result, verbose=verbose)
+                        if persisted_memory_id:
+                            console.print(
+                                f"[dim]Updated reasoning metadata on {persisted_memory_id}[/dim]"
+                            )
+                    return
+
                 payload = {
                     "error": "no_context",
                     "message": "No project context found. Run the daemon first.",
@@ -713,11 +1034,9 @@ def ask(
                     console.print("[dim]Run the daemon to capture sessions first.[/dim]")
                 return
 
-            # Build the LLM prompt
             context_block = "\n\n".join(context_parts)
             prompt = f"## Project Context\n{context_block}\n\n## Question\n{question}"
 
-            # Try LLM
             llm_fn = await create_llm_fn(
                 config,
                 system_prompt=ASK_SYSTEM_PROMPT,
@@ -725,7 +1044,6 @@ def ask(
             )
 
             if llm_fn is None:
-                # Fallback: show raw context
                 if json_output:
                     print(
                         json_mod.dumps(
@@ -754,6 +1072,7 @@ def ask(
                     json_mod.dumps(
                         {
                             "answer": answer,
+                            "mode": "shallow",
                             "sources": len(search_results) + len(valid_semantic),
                             "scope": scope_id,
                         },
@@ -781,7 +1100,7 @@ def ask(
     _run_async(_ask())
 
 
-@app.command()
+@admin_app.command("reason")
 def reason(
     question: str = typer.Argument(..., help="Question to explore via agentic reasoning"),
     project: Path | None = typer.Option(
@@ -792,27 +1111,15 @@ def reason(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show step-by-step trajectory"),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
 ) -> None:
-    """Agentic reasoning — LLM explores project history via a REPL loop.
-
-    Uses DSPy's RLM module to let the LLM programmatically search,
-    navigate, and query UC's graph database. More thorough than `uc ask`
-    but slower and more expensive.
-    """
+    """Legacy deep reasoning entrypoint. Prefer `uc ask --deep`."""
 
     async def _reason():
-        from .config import UCConfig
-        from .reason import reason as run_reason
-
         project_path = str((project or Path(".")).resolve())
-        config = UCConfig.load()
-
         if not json_output:
             console.print("[dim]Reasoning... (this may take a moment)[/dim]")
-
-        result = await run_reason(
+        result = await _run_reasoning(
             question=question,
             project_path=project_path,
-            config=config,
             max_iterations=max_iterations,
             max_llm_calls=max_llm_calls,
             verbose=verbose,
@@ -822,42 +1129,12 @@ def reason(
             print(json_mod.dumps(result, default=str))
             return
 
-        from rich.markdown import Markdown
-        from rich.panel import Panel
-
-        console.print(
-            Panel(
-                Markdown(result["answer"]),
-                title="Answer",
-                border_style="green",
-            )
-        )
-
-        if verbose and result.get("trajectory"):
-            console.print("\n[bold]Trajectory:[/bold]")
-            for i, step in enumerate(result["trajectory"], 1):
-                if isinstance(step, dict):
-                    code = step.get("code", "")
-                    output = step.get("output", "")
-                    console.print(f"\n[cyan]Step {i}:[/cyan]")
-                    if code:
-                        from rich.syntax import Syntax
-
-                        console.print(Syntax(str(code), "python", theme="monokai"))
-                    if output:
-                        console.print(f"[dim]{str(output)[:500]}[/dim]")
-                else:
-                    console.print(f"\n[cyan]Step {i}:[/cyan] {str(step)[:500]}")
-
-        scope_info = f"scope: {result.get('scope', 'none')}"
-        iterations = result.get("iterations")
-        iter_info = f"  iterations: {iterations}" if iterations else ""
-        console.print(f"\n[dim]{scope_info}{iter_info}[/dim]")
+        _render_reason_output(result, verbose=verbose)
 
     _run_async(_reason())
 
 
-@app.command("rebuild-index")
+@admin_app.command("rebuild-index")
 def rebuild_index(
     json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
 ) -> None:
@@ -883,7 +1160,7 @@ def rebuild_index(
     _run_async(_rebuild())
 
 
-@app.command()
+@admin_app.command("dashboard")
 def dashboard(
     dev: bool = typer.Option(False, "--dev", help="Enable dev mode"),
 ) -> None:
@@ -1014,31 +1291,6 @@ def daemon_status() -> None:
             console.print(f"[yellow]Daemon not running (stale PID: {pid})[/yellow]")
     else:
         console.print("[dim]Daemon is not running.[/dim]")
-
-
-# --- Checkpoint sub-commands ---
-
-
-@checkpoint_app.command("create")
-def checkpoint_create(
-    label: str | None = typer.Option(None, "--label", "-l", help="Checkpoint label"),
-) -> None:
-    """Create a checkpoint at the current position."""
-    console.print("[yellow]Checkpoints require Phase 7 (sharing & checkpointing).[/yellow]")
-
-
-@checkpoint_app.command("list")
-def checkpoint_list() -> None:
-    """List all checkpoints."""
-    console.print("[yellow]Checkpoints require Phase 7.[/yellow]")
-
-
-@checkpoint_app.command("restore")
-def checkpoint_restore(
-    checkpoint_id: str = typer.Argument(..., help="Checkpoint ID to restore"),
-) -> None:
-    """Restore from a checkpoint."""
-    console.print("[yellow]Checkpoints require Phase 7.[/yellow]")
 
 
 # --- Share sub-commands ---
@@ -1703,6 +1955,26 @@ def memory_refresh(
             await db.close()
 
     _run_async(_refresh())
+
+
+@memory_app.command("sync")
+def memory_sync(
+    project: Path | None = typer.Option(
+        None,
+        "--project",
+        "-p",
+        help="Project path (default: cwd)",
+    ),
+    target: str = typer.Option(
+        "AGENTS.md",
+        "--target",
+        "-t",
+        help="Target file to inject into after refresh",
+    ),
+) -> None:
+    """Refresh project memory, then inject it into a target file."""
+    memory_refresh(project=project, json_output=False)
+    memory_inject(project=project, target=target)
 
 
 @memory_app.command("history")
