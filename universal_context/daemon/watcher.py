@@ -14,11 +14,13 @@ from typing import Any
 from ..adapters.registry import get_registry
 from ..db.client import UCDatabase
 from ..db.queries import (
+    count_turns,
     create_job,
     create_run,
     create_scope,
     create_turn_with_artifact,
     end_run,
+    find_run_by_session_path,
     find_scope_by_canonical_id,
     find_scope_by_path,
     list_jobs,
@@ -117,7 +119,14 @@ class Watcher:
             await self._handle_session_end(path_key)
 
     async def _register_session(self, session_path: Path, adapter: Any) -> None:
-        """Register a newly discovered session."""
+        """Register a newly discovered session.
+
+        Deduplicates against existing runs in the DB to avoid re-ingesting
+        turns after daemon restart or DB reimport:
+        - Existing non-crashed run → reuse it, skip already-ingested turns
+        - Existing crashed run → new run, but start from crashed run's turn count
+        - No existing run → fresh run from scratch
+        """
         path_key = str(session_path)
         project_path = adapter.extract_project_path(session_path)
 
@@ -129,52 +138,76 @@ class Watcher:
                 Path.home(), name_override="unknown"
             )
 
-        # Capture git context for provenance
-        branch = None
-        commit_sha = None
-        if project_path:
-            branch = await asyncio.to_thread(get_current_branch, project_path)
-            commit_sha = await asyncio.to_thread(get_head_sha, project_path)
+        # Check if a run already exists for this session path
+        existing_run = await find_run_by_session_path(self._db, path_key)
 
-        # Create a run
-        run = await create_run(
-            self._db,
-            scope_id,
-            adapter.name,
-            session_path=str(session_path),
-            branch=branch,
-            commit_sha=commit_sha,
-        )
-        run_id = str(run["id"])
+        last_turn_count = 0
+        if existing_run and existing_run.get("status") != "crashed":
+            # Reuse the existing run (e.g. after reimport with completed runs)
+            run_id = str(existing_run["id"])
+            last_turn_count = await count_turns(self._db, run_id)
+            logger.info(
+                "Resuming existing run %s for session %s (turns=%d)",
+                run_id, session_path.name, last_turn_count,
+            )
+        else:
+            # Crashed run: start fresh but skip already-ingested turns
+            if existing_run:
+                last_turn_count = await count_turns(
+                    self._db, str(existing_run["id"]),
+                )
+                logger.info(
+                    "Crashed run %s found for session %s, skipping %d turns",
+                    str(existing_run["id"]), session_path.name, last_turn_count,
+                )
+
+            # Capture git context for provenance
+            branch = None
+            commit_sha = None
+            if project_path:
+                branch = await asyncio.to_thread(get_current_branch, project_path)
+                commit_sha = await asyncio.to_thread(get_head_sha, project_path)
+
+            # Create a new run
+            run = await create_run(
+                self._db,
+                scope_id,
+                adapter.name,
+                session_path=str(session_path),
+                branch=branch,
+                commit_sha=commit_sha,
+            )
+            run_id = str(run["id"])
+            logger.info(
+                "Registered session: %s (%s) -> run %s",
+                session_path.name,
+                adapter.name,
+                run_id,
+            )
+
+            # Detect runs from other branches that have been merged
+            if branch and project_path:
+                from ..db.queries import detect_merged_runs
+
+                try:
+                    merged = await detect_merged_runs(
+                        self._db, scope_id, branch, project_path,
+                    )
+                    if merged:
+                        logger.info("Detected %d merged run(s) into %s", merged, branch)
+                except Exception as e:
+                    logger.debug("Merge detection failed: %s", e)
 
         state = SessionState(
             session_path=session_path,
             adapter_name=adapter.name,
             scope_id=scope_id,
             run_id=run_id,
+            last_turn_count=last_turn_count,
         )
         self._sessions[path_key] = state
-        logger.info(
-            "Registered session: %s (%s) -> run %s",
-            session_path.name,
-            adapter.name,
-            run_id,
-        )
 
-        # Detect runs from other branches that have been merged into current branch
-        if branch and project_path:
-            from ..db.queries import detect_merged_runs
-
-            try:
-                merged = await detect_merged_runs(
-                    self._db, scope_id, branch, project_path,
-                )
-                if merged:
-                    logger.info("Detected %d merged run(s) into %s", merged, branch)
-            except Exception as e:
-                logger.debug("Merge detection failed: %s", e)
-
-        # Ingest any existing turns
+        # Ingest any new turns beyond what's already captured
         await self._check_new_turns(state, adapter)
 
     async def _check_new_turns(self, state: SessionState, adapter: Any) -> None:

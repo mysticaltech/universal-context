@@ -19,8 +19,10 @@ from universal_context.db.queries import (
     create_scope,
     create_turn_with_artifact,
     detect_merged_runs,
+    end_run,
     get_run,
     list_jobs,
+    list_runs,
 )
 from universal_context.db.schema import apply_schema
 
@@ -371,3 +373,94 @@ class TestMergeDetection:
 
         assert count == 0
         mock_ancestor.assert_not_called()
+
+
+# ============================================================
+# WATCHER SESSION DEDUP
+# ============================================================
+
+
+class TestWatcherSessionDedup:
+    """Test that _register_session deduplicates against existing DB runs."""
+
+    async def _make_adapter(self, name: str = "claude", turn_count: int = 3):
+        """Create a mock adapter for testing."""
+        from unittest.mock import MagicMock
+
+        adapter = MagicMock()
+        adapter.name = name
+        adapter.extract_project_path.return_value = None
+        adapter.count_turns.return_value = turn_count
+        adapter.extract_turn_info.return_value = None
+        return adapter
+
+    async def test_resume_existing_completed_run(self, db: UCDatabase):
+        """If a completed run exists for the session, reuse it — no new run created."""
+        scope = await create_scope(db, "proj", "/tmp/proj")
+        scope_id = str(scope["id"])
+        session_path = "/tmp/sessions/session_abc"
+
+        # Create a completed run with 3 turns already ingested
+        run = await create_run(db, scope_id, "claude", session_path=session_path)
+        run_id = str(run["id"])
+        await end_run(db, run_id, "completed")
+        for seq in range(1, 4):
+            await create_turn_with_artifact(
+                db, run_id, seq, f"msg{seq}", f"content{seq}", create_summary_job=False,
+            )
+
+        adapter = await self._make_adapter(turn_count=3)
+        watcher = Watcher(db=db, poll_interval=1.0)
+        await watcher._register_session(Path(session_path), adapter)
+
+        # Should reuse the existing run
+        state = watcher._sessions[session_path]
+        assert state.run_id == run_id
+        assert state.last_turn_count == 3
+
+        # No new run should have been created
+        runs = await list_runs(db, scope_id=scope_id)
+        assert len(runs) == 1
+
+    async def test_skip_turns_from_crashed_run(self, db: UCDatabase):
+        """Crashed run → new run, but start from crashed run's turn count."""
+        scope = await create_scope(db, "proj", "/tmp/proj")
+        scope_id = str(scope["id"])
+        session_path = "/tmp/sessions/session_def"
+
+        # Create a crashed run with 2 turns
+        run = await create_run(db, scope_id, "claude", session_path=session_path)
+        old_run_id = str(run["id"])
+        await end_run(db, old_run_id, "crashed")
+        for seq in range(1, 3):
+            await create_turn_with_artifact(
+                db, old_run_id, seq, f"msg{seq}", f"content{seq}",
+                create_summary_job=False,
+            )
+
+        adapter = await self._make_adapter(turn_count=2)
+        watcher = Watcher(db=db, poll_interval=1.0)
+        await watcher._register_session(Path(session_path), adapter)
+
+        state = watcher._sessions[session_path]
+        # Should have created a NEW run (not reused the crashed one)
+        assert state.run_id != old_run_id
+        # But should skip the 2 already-ingested turns
+        assert state.last_turn_count == 2
+
+        # Two runs should exist total: old crashed + new active
+        # (new run may be under a different scope since mock adapter has no project_path)
+        all_runs = await list_runs(db)
+        assert len(all_runs) == 2
+
+    async def test_first_time_session_creates_fresh_run(self, db: UCDatabase):
+        """No existing run → creates from scratch with last_turn_count=0."""
+        session_path = "/tmp/sessions/session_new"
+
+        adapter = await self._make_adapter(turn_count=0)
+        watcher = Watcher(db=db, poll_interval=1.0)
+        await watcher._register_session(Path(session_path), adapter)
+
+        state = watcher._sessions[session_path]
+        assert state.last_turn_count == 0
+        assert state.run_id  # Should have a run ID

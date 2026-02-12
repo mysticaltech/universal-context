@@ -104,6 +104,20 @@ class UCDaemon:
         # Recover from crashes
         await self._watcher.recover_interrupted_runs()
 
+        # Reset zombie running jobs back to pending (abandoned by dead worker)
+        from ..db.queries import recover_stale_running_jobs
+
+        recovered = await recover_stale_running_jobs(self._db)
+        if recovered:
+            logger.info("Reset %d stale running jobs to pending", recovered)
+
+        # Prune stale pending jobs (e.g. from reimport with already-summarized turns)
+        from ..db.queries import prune_stale_pending_jobs
+
+        pruned = await prune_stale_pending_jobs(self._db)
+        if pruned:
+            logger.info("Pruned %d stale pending summary jobs", pruned)
+
         # Backfill canonical_id on scopes that predate git-aware identity
         from ..db.queries import backfill_canonical_ids
 

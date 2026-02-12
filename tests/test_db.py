@@ -306,6 +306,159 @@ class TestJobQueue:
 
 
 # ============================================================
+# RECOVER STALE RUNNING JOBS
+# ============================================================
+
+
+class TestRecoverStaleRunningJobs:
+    async def test_resets_running_to_pending(self, db: UCDatabase):
+        """Running jobs should be reset to pending on recovery."""
+        await queries.create_job(db, "turn_summary", "turn:1")
+        claimed = await queries.claim_next_job(db)
+        assert claimed is not None
+        assert claimed["status"] == "running"
+
+        recovered = await queries.recover_stale_running_jobs(db)
+        assert recovered == 1
+
+        pending = await queries.list_jobs(db, status="pending")
+        assert len(pending) == 1
+        assert pending[0].get("started_at") is None
+
+    async def test_leaves_pending_and_completed_alone(self, db: UCDatabase):
+        """Only running jobs should be reset — pending and completed stay."""
+        await queries.create_job(db, "turn_summary", "turn:1")
+        await queries.create_job(db, "turn_summary", "turn:2")
+
+        # Claim and complete one
+        claimed = await queries.claim_next_job(db)
+        await queries.complete_job(db, str(claimed["id"]))
+
+        recovered = await queries.recover_stale_running_jobs(db)
+        assert recovered == 0
+
+        # Still have 1 pending, 1 completed
+        pending = await queries.list_jobs(db, status="pending")
+        completed = await queries.list_jobs(db, status="completed")
+        assert len(pending) == 1
+        assert len(completed) == 1
+
+
+# ============================================================
+# FIND RUN BY SESSION PATH
+# ============================================================
+
+
+class TestFindRunBySessionPath:
+    async def test_find_run_by_session_path(self, db: UCDatabase):
+        """Should find the most recent run matching a session path."""
+        scope = await queries.create_scope(db, "proj")
+        scope_id = str(scope["id"])
+        run = await queries.create_run(
+            db, scope_id, "claude", session_path="/tmp/sessions/abc",
+        )
+        run_id = str(run["id"])
+
+        found = await queries.find_run_by_session_path(db, "/tmp/sessions/abc")
+        assert found is not None
+        assert str(found["id"]) == run_id
+
+    async def test_find_run_by_session_path_no_match(self, db: UCDatabase):
+        """Should return None when no run matches."""
+        found = await queries.find_run_by_session_path(db, "/nonexistent/path")
+        assert found is None
+
+    async def test_find_run_returns_one_of_multiple(self, db: UCDatabase):
+        """When multiple runs share a session_path, should return one (most recent)."""
+        scope = await queries.create_scope(db, "proj")
+        scope_id = str(scope["id"])
+        path = "/tmp/sessions/multi"
+
+        run1 = await queries.create_run(db, scope_id, "claude", session_path=path)
+        run2 = await queries.create_run(db, scope_id, "claude", session_path=path)
+
+        found = await queries.find_run_by_session_path(db, path)
+        assert found is not None
+        # Should return one of the two runs
+        assert str(found["id"]) in {str(run1["id"]), str(run2["id"])}
+
+
+# ============================================================
+# PRUNE STALE PENDING JOBS
+# ============================================================
+
+
+class TestPruneStalePendingJobs:
+    async def test_prune_removes_stale_jobs(self, db: UCDatabase):
+        """Jobs for already-summarized turns should be pruned."""
+        scope = await queries.create_scope(db, "proj")
+        scope_id = str(scope["id"])
+        run = await queries.create_run(db, scope_id, "claude")
+        run_id = str(run["id"])
+
+        # Create a turn with a transcript artifact and pending summary job
+        result = await queries.create_turn_with_artifact(
+            db, run_id, 1, "msg", "content", create_summary_job=True,
+        )
+
+        # Simulate that a summary already exists: create a summary artifact
+        # that depends on the transcript
+        await queries.create_derived_artifact(
+            db, "summary", "already summarized", result["artifact_id"],
+        )
+
+        # Now prune — the pending job should be removed
+        pruned = await queries.prune_stale_pending_jobs(db)
+        assert pruned == 1
+
+        # Verify no pending jobs remain
+        pending = await queries.list_jobs(db, status="pending")
+        assert len(pending) == 0
+
+    async def test_prune_keeps_unsummarized_jobs(self, db: UCDatabase):
+        """Jobs for turns WITHOUT summaries should be kept."""
+        scope = await queries.create_scope(db, "proj")
+        scope_id = str(scope["id"])
+        run = await queries.create_run(db, scope_id, "claude")
+        run_id = str(run["id"])
+
+        # Create a turn with a pending job but no summary artifact yet
+        await queries.create_turn_with_artifact(
+            db, run_id, 1, "msg", "content", create_summary_job=True,
+        )
+
+        pruned = await queries.prune_stale_pending_jobs(db)
+        assert pruned == 0
+
+        # The pending job should still be there
+        pending = await queries.list_jobs(db, status="pending")
+        assert len(pending) == 1
+
+    async def test_prune_ignores_non_summary_dependents(self, db: UCDatabase):
+        """A non-summary artifact depending on a transcript should not trigger pruning."""
+        scope = await queries.create_scope(db, "proj")
+        scope_id = str(scope["id"])
+        run = await queries.create_run(db, scope_id, "claude")
+        run_id = str(run["id"])
+
+        result = await queries.create_turn_with_artifact(
+            db, run_id, 1, "msg", "content", create_summary_job=True,
+        )
+
+        # Create a non-summary artifact that depends on the transcript
+        await queries.create_derived_artifact(
+            db, "working_memory", "distilled memory", result["artifact_id"],
+        )
+
+        # Should NOT prune — the dependent is not a summary
+        pruned = await queries.prune_stale_pending_jobs(db)
+        assert pruned == 0
+
+        pending = await queries.list_jobs(db, status="pending")
+        assert len(pending) == 1
+
+
+# ============================================================
 # QUERY RETRY & TIMEOUT
 # ============================================================
 

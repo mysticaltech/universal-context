@@ -295,6 +295,18 @@ async def list_runs(
     )
 
 
+async def find_run_by_session_path(
+    db: UCDatabase, session_path: str,
+) -> dict[str, Any] | None:
+    """Find the most recent run for a session_path (any status)."""
+    result = await db.query(
+        "SELECT * FROM run WHERE session_path = $path "
+        "ORDER BY started_at DESC LIMIT 1",
+        {"path": session_path},
+    )
+    return result[0] if result else None
+
+
 # ============================================================
 # TURN (with atomic provenance)
 # ============================================================
@@ -700,32 +712,13 @@ async def create_job(
 async def claim_next_job(db: UCDatabase) -> dict[str, Any] | None:
     """Claim the next pending job (highest priority, oldest first).
 
-    On server mode, uses a SurrealQL transaction to atomically SELECT +
-    UPDATE so concurrent workers cannot double-claim the same job.
-    On embedded mode (single-process, fcntl-locked), uses plain SELECT +
-    UPDATE since there's no concurrency risk and the v2 embedded engine
-    doesn't support LET/IF inside transactions.
-    """
-    if db.is_server:
-        result = await db.query(
-            "BEGIN TRANSACTION;"
-            ' LET $job = (SELECT * FROM job WHERE status = "pending"'
-            "  ORDER BY priority DESC, created_at ASC LIMIT 1);"
-            " IF $job THEN"
-            '   UPDATE $job[0].id SET status = "running", started_at = time::now();'
-            " END;"
-            " COMMIT TRANSACTION;"
-        )
-        for item in result:
-            if isinstance(item, dict) and item.get("status") == "running":
-                return item
-            if isinstance(item, list) and item:
-                for sub in item:
-                    if isinstance(sub, dict) and sub.get("status") == "running":
-                        return sub
-        return None
+    Uses plain SELECT + UPDATE (two queries).  This is safe because the
+    daemon runs a single serial worker — no concurrent claim risk.
 
-    # Embedded fallback: plain SELECT + UPDATE (no concurrency risk)
+    Note: SurrealDB Python SDK v1 returns ``[]`` for ``BEGIN TRANSACTION``
+    blocks, so the transaction-based approach silently swallowed results,
+    causing jobs to leak into "running" without ever being processed.
+    """
     candidates = await db.query(
         'SELECT * FROM job WHERE status = "pending" ORDER BY priority DESC, created_at ASC LIMIT 1'
     )
@@ -788,6 +781,79 @@ async def count_jobs_by_status(db: UCDatabase) -> dict[str, int]:
     """Get job counts grouped by status."""
     result = await db.query("SELECT status, count() FROM job GROUP BY status")
     return {row["status"]: row["count"] for row in result} if result else {}
+
+
+async def recover_stale_running_jobs(db: UCDatabase) -> int:
+    """Reset zombie running jobs back to pending.
+
+    On daemon restart, any jobs stuck in 'running' status were abandoned
+    mid-processing by the dead worker.  Reset them so the new worker can
+    reclaim them.
+    """
+    result = await db.query(
+        'UPDATE job SET status = "pending", started_at = NONE '
+        'WHERE status = "running"'
+    )
+    return len(result) if isinstance(result, list) else 0
+
+
+async def prune_stale_pending_jobs(db: UCDatabase) -> int:
+    """Remove pending turn_summary jobs for turns that already have summaries.
+
+    After a reimport, pending jobs from the export snapshot remain but their
+    target turns may already have summary artifacts.  This prevents duplicate
+    summaries and wasted LLM calls.
+
+    Uses Python iteration with simple queries to stay compatible with both
+    embedded (v2) and server (v3) modes.
+    """
+    jobs = await db.query(
+        'SELECT * FROM job WHERE status = "pending" AND job_type = "turn_summary"'
+    )
+    if not isinstance(jobs, list) or not jobs:
+        return 0
+
+    pruned = 0
+    for job in jobs:
+        target = str(job.get("target", ""))
+        if not target:
+            continue
+        # target is a string like "turn:abc123"
+        # Check: does this turn have transcript artifacts that a summary depends on?
+        artifacts = await db.query(f"SELECT out FROM produced WHERE in = {target}")
+        if not isinstance(artifacts, list):
+            continue
+
+        has_summary = False
+        for edge in artifacts:
+            artifact_id = edge.get("out")
+            if not artifact_id:
+                continue
+            aid_str = str(artifact_id)
+            # Find artifacts that depend on this transcript (in=dependent, out=source)
+            deps = await db.query(f"SELECT in FROM depends_on WHERE out = {aid_str}")
+            for dep in deps if isinstance(deps, list) else []:
+                dep_id = dep.get("in")
+                if not dep_id:
+                    continue
+                # Verify the dependent is actually a summary artifact
+                dep_detail = await db.query(
+                    f"SELECT kind FROM {str(dep_id)}"
+                )
+                if dep_detail and dep_detail[0].get("kind") == "summary":
+                    has_summary = True
+                    break
+            if has_summary:
+                break
+
+        if not has_summary:
+            continue
+
+        job_id = str(job["id"])
+        await db.query(f"DELETE {job_id}")
+        pruned += 1
+
+    return pruned
 
 
 # ============================================================
