@@ -6,7 +6,11 @@ and indexes for performance-critical tables. Idempotent — safe to re-run.
 
 from __future__ import annotations
 
+import logging
+
 from .client import UCDatabase
+
+logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 4
 
@@ -140,12 +144,19 @@ async def rebuild_hnsw_index(db: UCDatabase, embedding_dim: int = 768) -> bool:
     HNSW indexes in SurrealDB v3 are build-once — data inserted after
     DEFINE INDEX is invisible to KNN queries. This forces a full rebuild.
 
-    Returns True if rebuilt (server mode), False if skipped (embedded).
+    Returns True if rebuilt (server mode), False if skipped/failed (embedded
+    or SurrealKV IO error).  HNSW creation can fail when SurrealKV vlog
+    compaction races with the full-table scan (surrealdb/surrealdb#6872).
+    Search self-heals via brute-force cosine fallback, so this is non-fatal.
     """
     if not db.is_server:
         return False
     await db.query("REMOVE INDEX IF EXISTS idx_artifact_embedding ON artifact")
-    await db.query(_HNSW_TEMPLATE.format(dim=embedding_dim))
+    try:
+        await db.query(_HNSW_TEMPLATE.format(dim=embedding_dim))
+    except RuntimeError as e:
+        logger.warning("HNSW index rebuild failed (non-fatal, search uses cosine fallback): %s", e)
+        return False
     return True
 
 

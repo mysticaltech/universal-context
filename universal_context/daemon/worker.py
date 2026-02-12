@@ -116,13 +116,10 @@ class Worker:
 
         from ..db.schema import rebuild_hnsw_index
 
-        try:
-            rebuilt = await rebuild_hnsw_index(self._db)
-            if rebuilt:
-                logger.info(
-                    "HNSW index rebuilt after %d new embeddings",
-                    self._embeddings_since_rebuild,
-                )
-            self._embeddings_since_rebuild = 0
-        except Exception as e:
-            logger.warning("HNSW rebuild failed: %s", e)
+        rebuilt = await rebuild_hnsw_index(self._db)
+        if rebuilt:
+            logger.info(
+                "HNSW index rebuilt after %d new embeddings",
+                self._embeddings_since_rebuild,
+            )
+        self._embeddings_since_rebuild = 0
