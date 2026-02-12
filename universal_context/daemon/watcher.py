@@ -20,11 +20,10 @@ from ..db.queries import (
     create_scope,
     create_turn_with_artifact,
     end_run,
-    find_run_by_session_path,
+    find_runs_by_session_path,
     find_scope_by_canonical_id,
     find_scope_by_path,
     list_jobs,
-    list_runs,
     list_scopes,
     update_scope,
 )
@@ -138,27 +137,33 @@ class Watcher:
                 Path.home(), name_override="unknown"
             )
 
-        # Check if a run already exists for this session path
-        existing_run = await find_run_by_session_path(self._db, path_key)
+        # Check existing runs for this session path and compute the highest ingested turn count
+        existing_runs = await find_runs_by_session_path(self._db, path_key)
 
         last_turn_count = 0
-        if existing_run and existing_run.get("status") != "crashed":
-            # Reuse the existing run (e.g. after reimport with completed runs)
-            run_id = str(existing_run["id"])
-            last_turn_count = await count_turns(self._db, run_id)
+        reusable_run = next(
+            (r for r in existing_runs if r.get("status") != "crashed"),
+            None,
+        )
+        for run in existing_runs:
+            turns = await count_turns(self._db, str(run["id"]))
+            if turns > last_turn_count:
+                last_turn_count = turns
+
+        if reusable_run:
+            # Reuse non-crashed run (e.g. completed run from reimport)
+            run_id = str(reusable_run["id"])
             logger.info(
-                "Resuming existing run %s for session %s (turns=%d)",
+                "Resuming existing run %s for session %s (max_turns=%d)",
                 run_id, session_path.name, last_turn_count,
             )
         else:
-            # Crashed run: start fresh but skip already-ingested turns
-            if existing_run:
-                last_turn_count = await count_turns(
-                    self._db, str(existing_run["id"]),
-                )
+            # No reusable run: create new run and skip already-ingested turns
+            # from any prior crashed runs.
+            if existing_runs:
                 logger.info(
-                    "Crashed run %s found for session %s, skipping %d turns",
-                    str(existing_run["id"]), session_path.name, last_turn_count,
+                    "Only crashed runs found for session %s, skipping %d already-ingested turns",
+                    session_path.name, last_turn_count,
                 )
 
             # Capture git context for provenance
@@ -319,7 +324,7 @@ class Watcher:
 
     async def recover_interrupted_runs(self) -> None:
         """On startup, mark any active runs as crashed."""
-        active_runs = await list_runs(self._db, status="active")
+        active_runs = await self._db.query('SELECT id FROM run WHERE status = "active"')
         for run in active_runs:
             run_id = str(run["id"])
             await end_run(self._db, run_id, "crashed")

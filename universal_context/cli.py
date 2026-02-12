@@ -1052,6 +1052,9 @@ def share_export(
     passphrase: str | None = typer.Option(None, "--passphrase", help="Encryption passphrase"),
 ) -> None:
     """Export a run as a portable share bundle (v2 with scope metadata)."""
+    if encrypt and not passphrase:
+        console.print("[red]--encrypt requires --passphrase[/red]")
+        raise typer.Exit(code=1)
 
     async def _export():
         from .db.schema import apply_schema
@@ -1061,7 +1064,7 @@ def share_export(
         await db.connect()
         try:
             await apply_schema(db)
-            pw = passphrase if encrypt else None
+            pw = passphrase if (encrypt or passphrase) else None
             result = await export_bundle(db, run_id, output_path=output, passphrase=pw)
             console.print(f"[green]Exported bundle:[/green] {result}")
         finally:

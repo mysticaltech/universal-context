@@ -30,6 +30,10 @@ async def create_checkpoint(
     turn = await get_turn(db, turn_id)
     if not turn:
         raise ValueError(f"Turn not found: {turn_id}")
+    if str(turn.get("run")) != run_id:
+        raise ValueError(
+            f"Turn {turn_id} does not belong to run {run_id}"
+        )
 
     turns = await list_turns(db, run_id)
     turn_count = len(turns)

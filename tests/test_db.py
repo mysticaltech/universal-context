@@ -89,6 +89,64 @@ class TestScopeQueries:
 
 
 # ============================================================
+# SCOPE MAINTENANCE
+# ============================================================
+
+
+class TestScopeMaintenance:
+    async def test_delete_scope_cascades_artifacts_and_jobs(self, db: UCDatabase):
+        scope = await queries.create_scope(db, "proj", "/tmp/proj")
+        scope_id = str(scope["id"])
+        run = await queries.create_run(db, scope_id, "claude")
+        run_id = str(run["id"])
+
+        created = await queries.create_turn_with_artifact(
+            db, run_id, 1, "msg", "content", create_summary_job=True,
+        )
+        transcript_id = created["artifact_id"]
+        summary_id = await queries.create_derived_artifact(
+            db, "summary", "summary", transcript_id, scope_id=scope_id,
+        )
+
+        await queries.delete_scope(db, scope_id)
+
+        # Scope/runs/turns removed
+        assert await queries.get_scope(db, scope_id) is None
+        runs = await queries.list_runs(db)
+        assert len(runs) == 0
+        turns = await db.query("SELECT * FROM turn")
+        assert len(turns) == 0
+
+        # Both transcript and derived summary removed
+        assert await db.query(f"SELECT * FROM {transcript_id}") == []
+        assert await db.query(f"SELECT * FROM {summary_id}") == []
+
+        # Queue jobs removed
+        jobs = await queries.list_jobs(db)
+        assert len(jobs) == 0
+
+    async def test_merge_scopes_does_not_duplicate_contains_edges(self, db: UCDatabase):
+        source = await queries.create_scope(db, "source", "/tmp/source")
+        source_id = str(source["id"])
+        target = await queries.create_scope(db, "target", "/tmp/target")
+        target_id = str(target["id"])
+
+        source_run = await queries.create_run(db, source_id, "claude")
+        source_run_id = str(source_run["id"])
+        target_run = await queries.create_run(db, target_id, "codex")
+        target_run_id = str(target_run["id"])
+
+        await queries.merge_scopes(db, source_id, target_id)
+
+        edges = await db.query(
+            f"SELECT in, out FROM contains WHERE in = {target_id} ORDER BY out"
+        )
+        pairs = [(str(e["in"]), str(e["out"])) for e in edges]
+        assert pairs.count((target_id, source_run_id)) == 1
+        assert pairs.count((target_id, target_run_id)) == 1
+
+
+# ============================================================
 # RUN QUERIES
 # ============================================================
 
@@ -342,45 +400,6 @@ class TestRecoverStaleRunningJobs:
         completed = await queries.list_jobs(db, status="completed")
         assert len(pending) == 1
         assert len(completed) == 1
-
-
-# ============================================================
-# FIND RUN BY SESSION PATH
-# ============================================================
-
-
-class TestFindRunBySessionPath:
-    async def test_find_run_by_session_path(self, db: UCDatabase):
-        """Should find the most recent run matching a session path."""
-        scope = await queries.create_scope(db, "proj")
-        scope_id = str(scope["id"])
-        run = await queries.create_run(
-            db, scope_id, "claude", session_path="/tmp/sessions/abc",
-        )
-        run_id = str(run["id"])
-
-        found = await queries.find_run_by_session_path(db, "/tmp/sessions/abc")
-        assert found is not None
-        assert str(found["id"]) == run_id
-
-    async def test_find_run_by_session_path_no_match(self, db: UCDatabase):
-        """Should return None when no run matches."""
-        found = await queries.find_run_by_session_path(db, "/nonexistent/path")
-        assert found is None
-
-    async def test_find_run_returns_one_of_multiple(self, db: UCDatabase):
-        """When multiple runs share a session_path, should return one (most recent)."""
-        scope = await queries.create_scope(db, "proj")
-        scope_id = str(scope["id"])
-        path = "/tmp/sessions/multi"
-
-        run1 = await queries.create_run(db, scope_id, "claude", session_path=path)
-        run2 = await queries.create_run(db, scope_id, "claude", session_path=path)
-
-        found = await queries.find_run_by_session_path(db, path)
-        assert found is not None
-        # Should return one of the two runs
-        assert str(found["id"]) in {str(run1["id"]), str(run2["id"])}
 
 
 # ============================================================

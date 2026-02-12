@@ -1,6 +1,7 @@
 """Tests for the daemon — watcher, worker, and processors."""
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -55,6 +56,27 @@ class TestWatcher:
 
         updated = await get_run(db, run_id)
         assert updated["status"] == "crashed"
+
+    async def test_recover_interrupted_runs_processes_all_active_runs(
+        self, db: UCDatabase,
+    ):
+        """Recovery should not be limited by default list_runs pagination."""
+        scope = await create_scope(db, "proj", "/tmp/proj")
+        scope_id = str(scope["id"])
+        for i in range(60):
+            await create_run(db, scope_id, "claude", session_path=f"/tmp/sessions/{i}")
+
+        watcher = Watcher(db=db, poll_interval=1.0)
+        await watcher.recover_interrupted_runs()
+
+        active_count = await db.query(
+            'SELECT count() FROM run WHERE status = "active" GROUP ALL'
+        )
+        crashed_count = await db.query(
+            'SELECT count() FROM run WHERE status = "crashed" GROUP ALL'
+        )
+        assert active_count[0]["count"] == 0
+        assert crashed_count[0]["count"] == 60
 
     async def test_ensure_scope_reuse(self, db: UCDatabase):
         """Watcher should reuse existing scope for same path."""
@@ -452,6 +474,51 @@ class TestWatcherSessionDedup:
         # (new run may be under a different scope since mock adapter has no project_path)
         all_runs = await list_runs(db)
         assert len(all_runs) == 2
+
+    async def test_skip_uses_max_turns_across_multiple_crashed_runs(
+        self, db: UCDatabase,
+    ):
+        """When several crashed runs exist, dedup should use the max captured turns."""
+        scope = await create_scope(db, "proj", "/tmp/proj")
+        scope_id = str(scope["id"])
+        session_path = "/tmp/sessions/session_multi_crash"
+
+        # Older crashed run with 3 turns captured
+        older = await create_run(db, scope_id, "claude", session_path=session_path)
+        older_id = str(older["id"])
+        for seq in range(1, 4):
+            await create_turn_with_artifact(
+                db, older_id, seq, f"msg{seq}", f"content{seq}",
+                create_summary_job=False,
+            )
+        await end_run(db, older_id, "crashed")
+
+        # Newer crashed run with fewer turns
+        newer = await create_run(db, scope_id, "claude", session_path=session_path)
+        newer_id = str(newer["id"])
+        await create_turn_with_artifact(
+            db, newer_id, 1, "msg1", "content1", create_summary_job=False,
+        )
+        await end_run(db, newer_id, "crashed")
+
+        # Set deterministic ordering without sleeping.
+        await db.query(
+            f"UPDATE {older_id} SET started_at = $started_at",
+            {"started_at": datetime(2024, 1, 1, tzinfo=UTC)},
+        )
+        await db.query(
+            f"UPDATE {newer_id} SET started_at = $started_at",
+            {"started_at": datetime(2024, 1, 2, tzinfo=UTC)},
+        )
+
+        adapter = await self._make_adapter(turn_count=3)
+        watcher = Watcher(db=db, poll_interval=1.0)
+        await watcher._register_session(Path(session_path), adapter)
+
+        state = watcher._sessions[session_path]
+        assert state.run_id not in {older_id, newer_id}
+        # Must skip all already-ingested turns, not just those in the latest crashed run
+        assert state.last_turn_count == 3
 
     async def test_first_time_session_creates_fresh_run(self, db: UCDatabase):
         """No existing run → creates from scratch with last_turn_count=0."""

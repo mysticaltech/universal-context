@@ -120,35 +120,72 @@ async def delete_scope(db: UCDatabase, scope_id: str) -> None:
 
     Walks the graph: scope -> runs -> turns -> artifacts, plus edges and jobs.
     """
-    # Find all runs in this scope
-    runs = await db.query(f"SELECT id FROM run WHERE scope = {scope_id}")
-    for run in runs:
-        rid = str(run["id"])
-        # Find turns in this run
+    run_rows = await db.query(f"SELECT id FROM run WHERE scope = {scope_id}")
+    run_ids = [str(r["id"]) for r in run_rows if isinstance(r, dict) and r.get("id")]
+
+    turn_ids: list[str] = []
+    for rid in run_ids:
         turns = await db.query(f"SELECT id FROM turn WHERE run = {rid}")
-        for turn in turns:
-            tid = str(turn["id"])
-            # Delete artifacts produced by this turn (and their edges)
-            await db.query(f"DELETE FROM produced WHERE in = {tid}")
-            artifacts = await db.query(f"SELECT ->produced->artifact AS aids FROM {tid}")
-            for a in artifacts:
-                for aid in a.get("aids") or []:
-                    aid_str = str(aid)
-                    await db.query(
-                        f"DELETE FROM depends_on WHERE in = {aid_str} OR out = {aid_str}"
-                    )
-                    await db.query(f"DELETE {aid_str}")
-            # Delete the turn and its edges
-            await db.query(f"DELETE FROM contains WHERE out = {tid}")
-            await db.query(f"DELETE {tid}")
-        # Delete jobs targeting turns in this run
-        await db.query(
-            f'DELETE FROM job WHERE target CONTAINS "{rid}" OR target CONTAINS "{scope_id}"'
+        turn_ids.extend(
+            str(t["id"]) for t in turns if isinstance(t, dict) and t.get("id")
         )
-        # Delete run and its edges
+
+    # Include all artifacts denormalized to this scope (transcript, summary, working_memory, etc.)
+    artifact_rows = await db.query(f"SELECT id FROM artifact WHERE scope = {scope_id}")
+    artifact_ids: set[str] = {
+        str(a["id"]) for a in artifact_rows if isinstance(a, dict) and a.get("id")
+    }
+
+    # Also include artifacts produced by scope turns in case legacy data lacks artifact.scope
+    for tid in turn_ids:
+        produced = await db.query(f"SELECT out FROM produced WHERE in = {tid}")
+        for edge in produced if isinstance(produced, list) else []:
+            out = edge.get("out") if isinstance(edge, dict) else None
+            if out:
+                artifact_ids.add(str(out))
+
+    # Remove jobs targeting this scope or any descendant records
+    await db.query("DELETE FROM job WHERE target = $target", {"target": scope_id})
+    for rid in run_ids:
+        await db.query("DELETE FROM job WHERE target = $target", {"target": rid})
+    for tid in turn_ids:
+        await db.query("DELETE FROM job WHERE target = $target", {"target": tid})
+
+    # Delete checkpoint records tied to this scope's runs/turns
+    checkpoint_ids: set[str] = set()
+    for rid in run_ids:
+        cps = await db.query(f"SELECT id FROM checkpoint WHERE run = {rid}")
+        checkpoint_ids.update(
+            str(c["id"]) for c in cps if isinstance(c, dict) and c.get("id")
+        )
+    for tid in turn_ids:
+        cps = await db.query(f"SELECT id FROM checkpoint WHERE turn = {tid}")
+        checkpoint_ids.update(
+            str(c["id"]) for c in cps if isinstance(c, dict) and c.get("id")
+        )
+
+    # Remove graph edges before record deletes
+    for aid in artifact_ids:
+        await db.query(f"DELETE FROM depends_on WHERE in = {aid} OR out = {aid}")
+        await db.query(f"DELETE FROM produced WHERE out = {aid}")
+    for tid in turn_ids:
+        await db.query(f"DELETE FROM produced WHERE in = {tid}")
+        await db.query(f"DELETE FROM contains WHERE out = {tid}")
+        await db.query(f"DELETE FROM checkpoint_at WHERE in = {tid} OR out = {tid}")
+    for rid in run_ids:
         await db.query(f"DELETE FROM contains WHERE out = {rid}")
+        await db.query(f"DELETE FROM checkpoint_at WHERE in = {rid} OR out = {rid}")
+
+    # Delete records from leaves upward
+    for cid in checkpoint_ids:
+        await db.query(f"DELETE {cid}")
+    for aid in artifact_ids:
+        await db.query(f"DELETE {aid}")
+    for tid in turn_ids:
+        await db.query(f"DELETE {tid}")
+    for rid in run_ids:
         await db.query(f"DELETE {rid}")
-    # Delete the scope itself and its edges
+
     await db.query(f"DELETE FROM contains WHERE in = {scope_id}")
     await db.query(f"DELETE {scope_id}")
 
@@ -159,6 +196,9 @@ async def merge_scopes(
     target_id: str,
 ) -> None:
     """Move all runs and artifacts from source scope into target, then delete source."""
+    moved_runs = await db.query(f"SELECT id FROM run WHERE scope = {source_id}")
+    moved_run_ids = [str(r["id"]) for r in moved_runs if isinstance(r, dict) and r.get("id")]
+
     # Re-point runs
     await db.query(f"UPDATE run SET scope = {target_id} WHERE scope = {source_id}")
     # Re-point artifacts
@@ -169,13 +209,14 @@ async def merge_scopes(
         "WHERE kind = 'working_memory' AND metadata.scope_id = $sid",
         {"tid": str(target_id), "sid": str(source_id)},
     )
-    # Move graph edges: delete old contains edges, create new ones
-    runs = await db.query(f"SELECT id FROM run WHERE scope = {target_id}")
+    # Move graph edges: delete old source edges, then add target edges for moved runs only
     await db.query(f"DELETE FROM contains WHERE in = {source_id}")
-    for run in runs:
-        rid = str(run["id"])
-        # Ensure edge exists (idempotent)
-        await db.query(f"RELATE {target_id}->contains->{rid}")
+    for rid in moved_run_ids:
+        existing = await db.query(
+            f"SELECT id FROM contains WHERE in = {target_id} AND out = {rid} LIMIT 1"
+        )
+        if not existing:
+            await db.query(f"RELATE {target_id}->contains->{rid}")
     # Delete the source scope
     await db.query(f"DELETE {source_id}")
 
@@ -295,16 +336,15 @@ async def list_runs(
     )
 
 
-async def find_run_by_session_path(
+async def find_runs_by_session_path(
     db: UCDatabase, session_path: str,
-) -> dict[str, Any] | None:
-    """Find the most recent run for a session_path (any status)."""
+) -> list[dict[str, Any]]:
+    """Find all runs for a session_path, newest first."""
     result = await db.query(
-        "SELECT * FROM run WHERE session_path = $path "
-        "ORDER BY started_at DESC LIMIT 1",
+        "SELECT * FROM run WHERE session_path = $path ORDER BY started_at DESC",
         {"path": session_path},
     )
-    return result[0] if result else None
+    return result if isinstance(result, list) else []
 
 
 # ============================================================
@@ -719,14 +759,22 @@ async def claim_next_job(db: UCDatabase) -> dict[str, Any] | None:
     blocks, so the transaction-based approach silently swallowed results,
     causing jobs to leak into "running" without ever being processed.
     """
-    candidates = await db.query(
-        'SELECT * FROM job WHERE status = "pending" ORDER BY priority DESC, created_at ASC LIMIT 1'
-    )
-    if not candidates:
-        return None
-    job_id = str(candidates[0]["id"])
-    result = await db.query(f'UPDATE {job_id} SET status = "running", started_at = time::now()')
-    return result[0] if result else None
+    # Retry a few times in case another worker/daemon races us on the same candidate.
+    for _ in range(3):
+        candidates = await db.query(
+            'SELECT * FROM job WHERE status = "pending" '
+            "ORDER BY priority DESC, created_at ASC LIMIT 1"
+        )
+        if not candidates:
+            return None
+        job_id = str(candidates[0]["id"])
+        result = await db.query(
+            f'UPDATE {job_id} SET status = "running", started_at = time::now() '
+            'WHERE status = "pending"'
+        )
+        if result:
+            return result[0]
+    return None
 
 
 async def complete_job(db: UCDatabase, job_id: str, result: dict[str, Any] | None = None) -> None:
