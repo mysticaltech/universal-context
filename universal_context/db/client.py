@@ -113,19 +113,24 @@ class UCDatabase:
         reports a transaction/IO failure inside the result payload.  We detect
         that here so callers don't have to guard against non-list returns.
 
-        Transient "Transaction conflict" errors are retried with linear backoff
-        (100ms, 200ms, 300ms) up to ``_retries`` attempts.
+        Transient "Transaction conflict" and "IO error" responses are retried
+        with linear backoff (100ms, 200ms, 300ms) up to ``_retries`` attempts.
+        The IO errors are a known SurrealDB v3 beta issue where concurrent
+        connections hit stale vlog pointers during surrealkv compaction
+        (surrealdb/surrealdb#6872).
         """
+        _retryable = ("Transaction conflict", "IO error")
         for attempt in range(_retries):
             result = await (self.db.query(surql, params) if params else self.db.query(surql))
             if isinstance(result, str):
-                if "Transaction conflict" in result and attempt < _retries - 1:
+                if any(msg in result for msg in _retryable) and attempt < _retries - 1:
                     delay = 0.1 * (attempt + 1)
                     logger.debug(
-                        "Transaction conflict (attempt %d/%d), retrying in %.1fs",
+                        "Retryable error (attempt %d/%d), retrying in %.1fs: %s",
                         attempt + 1,
                         _retries,
                         delay,
+                        result[:120],
                     )
                     await asyncio.sleep(delay)
                     continue
