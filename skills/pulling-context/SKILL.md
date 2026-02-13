@@ -62,10 +62,19 @@ uc admin inspect turn:abc123 --json
 uc memory show --project .
 uc memory refresh --project .
 uc memory sync --project .
+uc memory migrate-db --project .
+uc memory remember "note" --project . --type durable_fact
 uc memory history --project .
 ```
 
 Use `refresh` when memory looks stale. Use `sync` when you also want injection into `AGENTS.md`/`CLAUDE.md`.
+
+Durability-first recovery commands:
+
+```bash
+uc admin db rebuild --json
+uc admin db prove --project . --json
+```
 
 ## After significant work
 
@@ -106,11 +115,13 @@ uc status
 uc find "query" --project .
 uc ask "question" --project .
 uc ask "question" --project . --deep
+uc remember "fact" --project . --type durable_fact
 uc daemon start -f
 uc memory --help
 
 # Admin surface
 uc admin --help
+uc admin db --help
 uc admin context --project . --branch main --json
 uc admin reason "question" --verbose
 uc admin timeline --json

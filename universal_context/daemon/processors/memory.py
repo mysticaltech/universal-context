@@ -19,9 +19,11 @@ from ...db.queries import (
     store_embedding,
     upsert_working_memory,
 )
+from ...memory_repo import MEMORY_SECTIONS, append_section_entry
 from .base import BaseProcessor
 
 logger = logging.getLogger(__name__)
+MAX_SUMMARY_EVIDENCE_ROWS = 16
 
 MEMORY_SYSTEM_PROMPT = """\
 You are maintaining a project's persistent working memory — a hyper-compressed, \
@@ -78,6 +80,95 @@ should be integrated, not appended.
 - Do NOT narrate history. This is a state snapshot, not a changelog
 - When in doubt, cut. The agent can always query `uc find`/`uc ask` for details
 """
+
+
+def _classify_legacy_section(title: str) -> str:
+    lowered = title.lower()
+    if "architecture" in lowered:
+        return "architecture"
+    if "procedure" in lowered or "how to" in lowered:
+        return "procedures"
+    if "preference" in lowered:
+        return "preferences"
+    if "current" in lowered or "recent" in lowered or "active" in lowered:
+        return "state"
+    if "gotcha" in lowered or "learned" in lowered:
+        return "state"
+    if "question" in lowered:
+        return "open_questions"
+    if "decision" in lowered:
+        return "architecture"
+    return "state"
+
+
+def _split_memory_by_heading(raw: str) -> list[tuple[str, str]]:
+    import re
+
+    title_re = re.compile(r"^##\s+(?P<title>.+)$")
+    current_title = "state"
+    current_body: list[str] = []
+    blocks: list[tuple[str, str]] = []
+
+    for line in raw.splitlines():
+        match = title_re.match(line.strip())
+        if not match:
+            current_body.append(line)
+            continue
+
+        if any(token.strip() for token in current_body):
+            blocks.append((current_title, "\n".join(current_body).strip()))
+            current_body = []
+        current_title = match.group("title")
+
+    if any(token.strip() for token in current_body):
+        blocks.append((current_title, "\n".join(current_body).strip()))
+
+    if not blocks and raw.strip():
+        blocks.append(("state", raw.strip()))
+    return blocks
+
+
+def _to_section_payload(raw: str) -> dict[str, str]:
+    routed: dict[str, str] = {section: "" for section in MEMORY_SECTIONS}
+    for title, block in _split_memory_by_heading(raw):
+        section = _classify_legacy_section(title)
+        if section in routed:
+            section_buffer = routed[section].strip()
+            routed[section] = f"{section_buffer}\n\n{block.strip()}".strip()
+    return {section: text for section, text in routed.items() if text.strip()}
+
+
+def _build_summary_evidence(
+    summaries: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Convert distillation inputs into compact evidence rows."""
+    dedup: set[tuple[str, str]] = set()
+    evidence: list[dict[str, str]] = []
+
+    for item in summaries:
+        run_id = item.get("run_id")
+        turn_id = item.get("turn_id")
+
+        if run_id:
+            key = ("run_id", str(run_id))
+            if key not in dedup:
+                dedup.add(key)
+                evidence.append({"run_id": str(run_id)})
+                if len(evidence) >= MAX_SUMMARY_EVIDENCE_ROWS:
+                    break
+
+        if turn_id:
+            key = ("turn_id", str(turn_id))
+            if key not in dedup:
+                dedup.add(key)
+                evidence.append({"turn_id": str(turn_id)})
+                if len(evidence) >= MAX_SUMMARY_EVIDENCE_ROWS:
+                    break
+
+        if len(evidence) >= MAX_SUMMARY_EVIDENCE_ROWS:
+            break
+
+    return evidence
 
 
 def _format_summaries(summaries: list[dict[str, Any]]) -> str:
@@ -174,12 +265,45 @@ class WorkingMemoryProcessor(BaseProcessor):
         if not memory_content:
             raise ValueError("LLM returned empty working memory")
 
-        # 5. Store new working memory artifact
+        # 5. Persist durable memory sections first
+        canonical_id = scope.get("canonical_id")
+        scope_path = str(scope.get("path")) if scope.get("path") else None
+        if not canonical_id and scope.get("path"):
+            from pathlib import Path
+
+            from ...git import resolve_canonical_id
+
+            canonical_id = resolve_canonical_id(Path(scope_path))
+        canonical_id = canonical_id or scope_id
+
+        routed_sections = _to_section_payload(memory_content)
+        if not routed_sections and memory_content.strip():
+            routed_sections = {"state": memory_content.strip()}
+
+        evidence = _build_summary_evidence(summaries)
+        section_confidence = 0.9 if routed_sections else 0.6
+
+        for section, text in routed_sections.items():
+            append_section_entry(
+                canonical_id=canonical_id,
+                section=section,
+                display_name=scope_name,
+                content=text,
+                memory_type="durable_fact",
+                confidence=section_confidence,
+                manual=False,
+                source="distilled",
+                produced_by_model="llm-distiller",
+                evidence=evidence,
+                scope_path=scope_path,
+            )
+
+        # 6. Store working memory artifact (derived index)
         artifact_id = await upsert_working_memory(
             db, scope_id, memory_content, method="llm",
         )
 
-        # 6. Optionally embed for semantic search
+        # 7. Optionally embed for semantic search
         embedded = False
         if self._embed_fn is not None:
             try:

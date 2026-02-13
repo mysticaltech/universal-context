@@ -22,12 +22,15 @@ uc "question about project memory"
 uc find "query" --project .
 uc ask "question" --project .
 uc ask "question" --project . --deep
+uc remember "fact" --project . --type durable_fact
 uc daemon start -f
 uc memory sync --project .
 
 # Working memory
 uc memory show --project .
 uc memory refresh --project .
+uc memory migrate-db --project .
+uc memory remember "note" --project . --type procedure
 uc memory inject --project .
 
 # Admin-only commands
@@ -38,6 +41,8 @@ uc admin share export run:abc123 -o bundle.json
 uc admin share import bundle.json --project .
 uc admin scope list --json
 uc admin rebuild-index
+uc admin db rebuild --json
+uc admin db prove --project . --json
 uc admin timeline --branch main
 uc admin inspect turn:abc123
 

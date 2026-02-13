@@ -24,6 +24,7 @@ class UCApp(typer.Typer):
         "status",
         "find",
         "ask",
+        "remember",
         "daemon",
         "memory",
         "admin",
@@ -64,6 +65,9 @@ app.add_typer(admin_app, name="admin")
 
 share_app = typer.Typer(help="Export and import share bundles")
 admin_app.add_typer(share_app, name="share")
+
+db_admin_app = typer.Typer(help="Rebuild and recover derived storage")
+admin_app.add_typer(db_admin_app, name="db")
 
 config_app = typer.Typer(help="View and modify configuration")
 admin_app.add_typer(config_app, name="config")
@@ -139,11 +143,14 @@ def main(ctx: typer.Context) -> None:
 def init() -> None:
     """Set up UC home directory (~/.uc/) and default config."""
     from .config import get_default_config_content
+    from .memory_repo import bootstrap_memory_repo
 
     uc_home = get_uc_home()
 
-    for subdir in ["data", "blobs", "shares"]:
+    for subdir in ["data", "blobs", "shares", "memory"]:
         (uc_home / subdir).mkdir(parents=True, exist_ok=True)
+
+    bootstrap_memory_repo(uc_home / "memory", init_git=True)
 
     config_path = uc_home / "config.yaml"
     if not config_path.exists():
@@ -875,9 +882,16 @@ def ask(
         from .config import UCConfig
         from .db.queries import get_working_memory, search_artifacts
         from .db.schema import apply_schema
+        from .git import resolve_canonical_id
         from .llm import ASK_SYSTEM_PROMPT, create_llm_fn
+        from .memory_repo import (
+            MEMORY_SECTIONS,
+            list_scope_sections,
+            render_section_text,
+        )
 
         project_path = str((project or Path(".")).resolve())
+        project_dir = Path(project_path)
 
         if deep:
             if not json_output:
@@ -905,19 +919,69 @@ def ask(
 
         config = UCConfig.load()
 
-        db = _get_db()
-        await db.connect()
+        context_parts: list[str] = []
+        search_results: list[dict[str, Any]] = []
+        valid_semantic: list[dict[str, Any]] = []
+        scope_id: str | None = None
+
+        canonical_id = ""
         try:
+            canonical_id = resolve_canonical_id(project_dir)
+        except Exception:
+            canonical_id = ""
+
+        if canonical_id:
+            repo_sections = list_scope_sections(
+                canonical_id=canonical_id,
+                display_name=project_dir.name,
+                scope_path=project_path,
+            )
+            repo_parts = []
+            for section in MEMORY_SECTIONS:
+                entries = repo_sections.get(section, [])
+                rendered = render_section_text(entries)
+                if rendered:
+                    title = section.replace("_", " ").title()
+                    repo_parts.append(f"## {title}\n{rendered}")
+            if repo_parts:
+                context_parts.append("\n\n".join(repo_parts))
+
+        db = None
+        db_connected = False
+        try:
+            db = _get_db()
+            await db.connect()
+            db_connected = True
             await apply_schema(db)
+
             scope = await _resolve_scope(db, project_path)
             scope_id = str(scope["id"]) if scope else None
 
-            context_parts: list[str] = []
+            if scope_id and not context_parts:
+                scope_canonical = scope.get("canonical_id") if scope else None
+                if scope and not scope_canonical and scope.get("path"):
+                    scope_canonical = resolve_canonical_id(Path(scope["path"]))
 
-            if scope_id:
-                memory = await get_working_memory(db, scope_id)
-                if memory and memory.get("content"):
-                    context_parts.append(f"## Working Memory\n{memory['content']}")
+                scope_repo_parts = []
+                if scope_canonical:
+                    sections = list_scope_sections(
+                        canonical_id=scope_canonical,
+                        display_name=str(scope.get("name", project_dir.name)),
+                        scope_path=str(scope.get("path", project_path)),
+                    )
+                    for section in MEMORY_SECTIONS:
+                        entries = sections.get(section, [])
+                        rendered = render_section_text(entries)
+                        if rendered:
+                            title = section.replace("_", " ").title()
+                            scope_repo_parts.append(f"## {title}\n{rendered}")
+
+                if scope_repo_parts:
+                    context_parts.append("\n\n".join(scope_repo_parts))
+                else:
+                    memory = await get_working_memory(db, scope_id)
+                    if memory and memory.get("content"):
+                        context_parts.append(f"## Working Memory\n{memory['content']}")
 
             search_results = await search_artifacts(
                 db,
@@ -939,109 +1003,128 @@ def ask(
             )
             valid_semantic = [r for r in semantic_results if "error" not in r]
             if valid_semantic:
-                sem_text = "\n".join(f"- {r.get('content', '')[:500]}" for r in valid_semantic)
+                sem_text = "\n".join(
+                    f"- {r.get('content', '')[:500]}" for r in valid_semantic
+                )
                 context_parts.append(f"## Semantic Matches\n{sem_text}")
-
+        except Exception as exc:
             if not context_parts:
-                if auto_deep:
-                    if not json_output:
-                        console.print(
-                            "[dim]Shallow context missing. Escalating to deep reasoning...[/dim]"
-                        )
-                    result = await _run_reasoning(
-                        question=question,
-                        project_path=project_path,
-                        max_iterations=max_iterations,
-                        max_llm_calls=max_llm_calls,
-                        verbose=verbose,
-                    )
-                    persisted_memory_id = await _persist_reasoning_snapshot(project_path, result)
-                    if json_output:
-                        payload = dict(result)
-                        payload["mode"] = "deep_auto"
-                        payload["persisted_working_memory"] = persisted_memory_id
-                        print(json_mod.dumps(payload, default=str))
-                    else:
-                        _render_reason_output(result, verbose=verbose)
-                        if persisted_memory_id:
-                            console.print(
-                                f"[dim]Updated reasoning metadata on {persisted_memory_id}[/dim]"
-                            )
-                    return
-
-                payload = {
-                    "error": "no_context",
-                    "message": "No project context found. Run the daemon first.",
-                }
-                if json_output:
-                    print(json_mod.dumps(payload))
-                else:
-                    console.print("[yellow]No project context found.[/yellow]")
-                    console.print("[dim]Run the daemon to capture sessions first.[/dim]")
-                return
-
-            context_block = "\n\n".join(context_parts)
-            prompt = f"## Project Context\n{context_block}\n\n## Question\n{question}"
-
-            llm_fn = await create_llm_fn(
-                config,
-                system_prompt=ASK_SYSTEM_PROMPT,
-                max_tokens=1000,
-            )
-
-            if llm_fn is None:
                 if json_output:
                     print(
                         json_mod.dumps(
                             {
-                                "answer": None,
-                                "context": context_block,
-                                "message": "No LLM configured. Showing raw context.",
-                            },
-                            default=str,
+                                "error": "db_unavailable",
+                                "message": str(exc),
+                            }
                         )
                     )
                 else:
-                    console.print("[yellow]No LLM configured — showing raw context:[/yellow]\n")
-                    from rich.markdown import Markdown
+                    console.print("[yellow]DB unavailable and no durable memory found.[/yellow]")
+                return
+            if not json_output:
+                console.print("[dim]DB unavailable; answering from durable memory only.[/dim]")
+        finally:
+            if db_connected and db is not None:
+                await db.close()
 
-                    console.print(Markdown(context_block))
+        if not context_parts:
+            if auto_deep:
+                if not json_output:
+                    console.print(
+                        "[dim]Shallow context missing. Escalating to deep reasoning...[/dim]"
+                    )
+                result = await _run_reasoning(
+                    question=question,
+                    project_path=project_path,
+                    max_iterations=max_iterations,
+                    max_llm_calls=max_llm_calls,
+                    verbose=verbose,
+                )
+                persisted_memory_id = await _persist_reasoning_snapshot(project_path, result)
+                if json_output:
+                    payload = dict(result)
+                    payload["mode"] = "deep_auto"
+                    payload["persisted_working_memory"] = persisted_memory_id
+                    print(json_mod.dumps(payload, default=str))
+                else:
+                    _render_reason_output(result, verbose=verbose)
+                    if persisted_memory_id:
+                        console.print(
+                            f"[dim]Updated reasoning metadata on {persisted_memory_id}[/dim]"
+                        )
                 return
 
-            if not json_output:
-                console.print("[dim]Thinking...[/dim]")
+            payload = {
+                "error": "no_context",
+                "message": "No project context found. Run the daemon first.",
+            }
+            if json_output:
+                print(json_mod.dumps(payload))
+            else:
+                console.print("[yellow]No project context found.[/yellow]")
+                console.print("[dim]Run the daemon to capture sessions first.[/dim]")
+            return
 
-            answer = await llm_fn(prompt)
+        context_block = "\n\n".join(context_parts)
+        prompt = f"## Project Context\n{context_block}\n\n## Question\n{question}"
 
+        llm_fn = await create_llm_fn(
+            config,
+            system_prompt=ASK_SYSTEM_PROMPT,
+            max_tokens=1000,
+        )
+
+        if llm_fn is None:
             if json_output:
                 print(
                     json_mod.dumps(
                         {
-                            "answer": answer,
-                            "mode": "shallow",
-                            "sources": len(search_results) + len(valid_semantic),
-                            "scope": scope_id,
+                            "answer": None,
+                            "context": context_block,
+                            "message": "No LLM configured. Showing raw context.",
                         },
                         default=str,
                     )
                 )
             else:
+                console.print("[yellow]No LLM configured — showing raw context:[/yellow]\n")
                 from rich.markdown import Markdown
-                from rich.panel import Panel
 
-                console.print(
-                    Panel(
-                        Markdown(answer),
-                        title="Answer",
-                        border_style="green",
-                    )
+                console.print(Markdown(context_block))
+            return
+
+        if not json_output:
+            console.print("[dim]Thinking...[/dim]")
+
+        answer = await llm_fn(prompt)
+
+        if json_output:
+            print(
+                json_mod.dumps(
+                    {
+                        "answer": answer,
+                        "mode": "shallow",
+                        "sources": len(search_results) + len(valid_semantic),
+                        "scope": scope_id,
+                    },
+                    default=str,
                 )
-                console.print(
-                    f"[dim]Sources: {len(search_results)} keyword + "
-                    f"{len(valid_semantic)} semantic matches[/dim]"
+            )
+        else:
+            from rich.markdown import Markdown
+            from rich.panel import Panel
+
+            console.print(
+                Panel(
+                    Markdown(answer),
+                    title="Answer",
+                    border_style="green",
                 )
-        finally:
-            await db.close()
+            )
+            console.print(
+                f"[dim]Sources: {len(search_results)} keyword + "
+                f"{len(valid_semantic)} semantic matches[/dim]"
+            )
 
     _run_async(_ask())
 
@@ -1104,6 +1187,354 @@ def rebuild_index(
             await db.close()
 
     _run_async(_rebuild())
+
+
+@db_admin_app.command("rebuild")
+def rebuild_db(
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help="Replay sessions modified on/after this ISO timestamp",
+    ),
+    llm_missing: bool = typer.Option(
+        False,
+        "--llm-missing",
+        help="Use LLM when a summary cache entry is missing",
+    ),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help="Ignore summary sidecars and always recompute summaries",
+    ),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Rebuild derived DB from captured sessions and rehydrate memory projections."""
+
+    async def _rebuild() -> None:
+        from .config import UCConfig
+        from .db.schema import apply_schema
+        from .embed import create_embed_provider
+        from .rebuild import rebuild_derived_db
+
+        config = UCConfig.load()
+
+        db = _get_db()
+        await db.connect()
+        try:
+            embed_provider = await create_embed_provider(config)
+            embedding_dim = embed_provider.dim if embed_provider else 768
+            await apply_schema(db, embedding_dim=embedding_dim)
+
+            try:
+                result = await rebuild_derived_db(
+                    db,
+                    config,
+                    since=since,
+                    llm_missing=llm_missing,
+                    no_cache=no_cache,
+                )
+            except ValueError as exc:
+                raise typer.BadParameter(str(exc))
+
+            if json_output:
+                print(json_mod.dumps(result, default=str))
+                return
+
+            console.print(f"[green]Rebuild mode:[/green] {result['mode']}")
+            console.print(f"[green]Runs created:[/green] {result['runs_created']}")
+            console.print(f"[green]Turns replayed:[/green] {result['turns_replayed']}")
+            console.print(
+                f"[green]Summary jobs processed:[/green] "
+                f"{result['summary_jobs_processed']}"
+            )
+            if result["summary_jobs_failed"]:
+                console.print(
+                    f"[yellow]Summary jobs failed:[/yellow] "
+                    f"{result['summary_jobs_failed']}"
+                )
+            console.print(
+                f"[green]Working memory projections:[/green] "
+                f"{result['working_memory_rehydrated']}"
+            )
+            console.print(f"[green]HNSW rebuilt:[/green] {result['hnsw_rebuilt']}")
+        finally:
+            await db.close()
+
+    _run_async(_rebuild())
+
+
+@db_admin_app.command("prove")
+def prove_db(
+    project: Path | None = typer.Option(
+        None,
+        "--project",
+        "-p",
+        help="Target one scope for proof (default: all discovered scopes).",
+    ),
+    skip_rebuild: bool = typer.Option(
+        False,
+        "--skip-rebuild",
+        help="Validate file-backed continuity without rebuilding DB.",
+    ),
+    since: str | None = typer.Option(
+        None,
+        "--since",
+        help="If rebuilding, replay sessions modified on/after this ISO timestamp.",
+    ),
+    llm_missing: bool = typer.Option(
+        False,
+        "--llm-missing",
+        help="If rebuilding, use LLM on cache misses.",
+    ),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help="If rebuilding, ignore summary sidecars and recompute summaries.",
+    ),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Emit machine-readable output."),
+) -> None:
+    """Verify durability invariants and rebuild restoration (proof command)."""
+
+    async def _prove() -> None:
+        from .config import UCConfig
+        from .db.queries import (
+            get_provenance_chain,
+            get_working_memory,
+            hybrid_search,
+            list_scopes,
+            search_artifacts,
+        )
+        from .db.schema import apply_schema
+        from .embed import create_embed_provider
+        from .memory_repo import normalize_canonical_id
+        from .rebuild import rebuild_derived_db
+
+        project_scopes = _collect_memory_repo_scopes(project)
+        if not project_scopes:
+            if project:
+                raise typer.BadParameter(f"No durable memory scope found for {project}")
+            raise typer.BadParameter("No durable memory scopes found in ~/.uc/memory.")
+
+        continuity_checks: list[dict[str, Any]] = []
+        probe_scopes: list[dict[str, Any]] = []
+        for scope_record in project_scopes:
+            sections, flat_entries, count = _gather_scope_entries(scope_record)
+            probe = _derive_probe_text(flat_entries)
+            scope_name = str(
+                scope_record.get("scope_name")
+                or scope_record.get("display_name")
+                or "project"
+            )
+            continuity_checks.append(
+                {
+                    "canonical_id": scope_record["canonical_id"],
+                    "scope_name": scope_name,
+                    "entries": count,
+                    "sections": {name: len(entries) for name, entries in sections.items()},
+                    "probe": probe,
+                },
+            )
+            if count > 0:
+                probe_scopes.append(
+                    {
+                        "scope_record": scope_record,
+                        "probe": probe,
+                        "entry_count": count,
+                        "scope_name": scope_name,
+                    }
+                )
+
+        continuity_ok = len(continuity_checks) > 0
+        rebuild_checks: list[dict[str, Any]] = []
+        rebuild_ok = False
+        db_rebuild_result: dict[str, Any] | None = None
+
+        if not skip_rebuild:
+            config = UCConfig.load()
+            db = _get_db()
+            await db.connect()
+            try:
+                embed_provider = await create_embed_provider(config)
+                embedding_dim = embed_provider.dim if embed_provider else 768
+                await apply_schema(db, embedding_dim=embedding_dim)
+
+                try:
+                    db_rebuild_result = await rebuild_derived_db(
+                        db,
+                        config,
+                        since=since,
+                        llm_missing=llm_missing,
+                        no_cache=no_cache,
+                    )
+                except ValueError as exc:
+                    raise typer.BadParameter(str(exc))
+
+                db_scopes = await list_scopes(db)
+                scope_index = _build_scope_index(db_scopes)
+                db_scope_records = {str(scope["id"]): scope for scope in db_scopes}
+
+                for item in probe_scopes:
+                    scope_record = item["scope_record"]
+                    probe = item["probe"]
+                    canonical_id = str(scope_record["canonical_id"])
+                    normalized_canonical = normalize_canonical_id(canonical_id)
+                    scope_id = scope_index.get(normalized_canonical, "")
+                    if not scope_id:
+                        # fallback by path if canonical matching failed
+                        for sid, scope in db_scope_records.items():
+                            if str(scope.get("path") or "") == str(scope_record.get("path") or ""):
+                                scope_id = sid
+                                break
+
+                    check = {
+                        "canonical_id": canonical_id,
+                        "scope_id": scope_id,
+                        "scope_name": item["scope_name"],
+                        "entry_count": item["entry_count"],
+                        "scope_lookup": normalized_canonical,
+                        "scope_found": bool(scope_id),
+                        "search_scoped": False,
+                        "working_memory_present": False,
+                        "working_memory_method": "",
+                        "provenance_ok": False,
+                    }
+
+                    if scope_id:
+                        working = await get_working_memory(db, scope_id)
+                        if working:
+                            check["working_memory_present"] = True
+                            check["working_memory_method"] = (
+                                working.get("metadata", {}).get("method", "")
+                            )
+
+                        # Require a non-empty search probe only if we have repo content.
+                        if item["entry_count"] > 0 and probe:
+                            if embed_provider is not None and probe:
+                                try:
+                                    query_embedding = await embed_provider.embed_query(probe)
+                                    results = await hybrid_search(
+                                        db,
+                                        query_text=probe,
+                                        query_embedding=query_embedding,
+                                        limit=12,
+                                    )
+                                except Exception:
+                                    results = []
+                            elif probe:
+                                results = await search_artifacts(db, probe, limit=12)
+                            else:
+                                results = []
+
+                            if results:
+                                for result in results:
+                                    if str(result.get("scope", "")) != scope_id:
+                                        continue
+                                    if str(result.get("kind", "")) == "working_memory":
+                                        continue
+                                    artifact_id = str(result.get("id", ""))
+                                    if not artifact_id:
+                                        continue
+                                    chain = await get_provenance_chain(db, artifact_id)
+                                    check["search_scoped"] = True
+                                    check["search_probe"] = probe
+                                    check["search_hit_count"] = len(results)
+                                    check["provenance_chain_len"] = len(chain)
+                                    if chain:
+                                        check["provenance_ok"] = True
+                                        break
+                                    check["provenance_check_target"] = artifact_id
+
+                    rebuild_checks.append(check)
+
+                def _scope_ok(entry: dict[str, Any]) -> bool:
+                    if entry["entry_count"] <= 0:
+                        return True
+                    if not entry["scope_found"] or not entry["working_memory_present"]:
+                        return False
+                    if entry.get("working_memory_method") != "memory_repo":
+                        return False
+                    if not entry["search_scoped"] or not entry["provenance_ok"]:
+                        return False
+                    return True
+
+                if probe_scopes:
+                    rebuild_ok = all(_scope_ok(item) for item in rebuild_checks)
+                else:
+                    rebuild_ok = True
+
+            finally:
+                await db.close()
+
+        result_payload = {
+            "continuity_checks": continuity_checks,
+            "continuity_ok": continuity_ok,
+            "rebuild_run": not skip_rebuild,
+            "rebuild_ok": rebuild_ok,
+            "rebuild_result": db_rebuild_result,
+            "scope_checks": rebuild_checks,
+        }
+
+        if json_output:
+            print(json_mod.dumps(result_payload, default=str))
+            return
+
+        if not continuity_ok:
+            console.print("[red]Continuity check failed[/red]")
+            raise typer.Exit(code=1)
+
+        if skip_rebuild:
+            console.print("[green]Continuity check passed[/green]")
+            console.print(f"[dim]Discovered durable scopes: {len(continuity_checks)}[/dim]")
+            for entry in continuity_checks:
+                console.print(
+                    f"[dim]{entry['scope_name']}[/dim] entries={entry['entries']} "
+                    f"canonical={entry['canonical_id']}"
+                )
+            return
+
+        if rebuild_ok:
+            console.print("[green]Rebuild proof passed[/green]")
+            if db_rebuild_result:
+                console.print(
+                    f"[dim]Rebuild: mode={db_rebuild_result['mode']} "
+                    f"runs={db_rebuild_result['runs_created']} "
+                    f"turns={db_rebuild_result['turns_replayed']} "
+                    f"wm={db_rebuild_result['working_memory_rehydrated']}[/dim]"
+                )
+            failed_search = [
+                item
+                for item in rebuild_checks
+                if item.get("entry_count", 0) > 0 and not item.get("search_scoped")
+            ]
+            failed_provenance = [
+                item
+                for item in rebuild_checks
+                if item.get("entry_count", 0) > 0 and not item.get("provenance_ok")
+            ]
+            if failed_search:
+                console.print(f"[red]Scopes failing scoped search: {len(failed_search)}[/red]")
+                for item in failed_search:
+                    console.print(f"  - {item['scope_name']} ({item['scope_id']})")
+                raise typer.Exit(code=1)
+            if failed_provenance:
+                console.print(
+                    f"[yellow]Scopes with weak provenance checks: {len(failed_provenance)}[/yellow]"
+                )
+                for item in failed_provenance:
+                    console.print(
+                        f"  - {item['scope_name']} "
+                        f"target={item.get('provenance_check_target', 'none')}"
+                    )
+                raise typer.Exit(code=1)
+            validated = sum(1 for item in rebuild_checks if item.get("scope_id"))
+            console.print(
+                f"[dim]Scopes validated: {validated}[/dim]"
+            )
+        else:
+            console.print("[red]Rebuild proof failed[/red]")
+            raise typer.Exit(code=1)
+
+    _run_async(_prove())
 
 
 @admin_app.command("dashboard")
@@ -1722,76 +2153,120 @@ def memory_show(
     """Show the working memory for a project."""
 
     async def _show():
-        from .db.queries import get_working_memory
-        from .db.schema import apply_schema
+        from .git import resolve_canonical_id
+        from .memory_repo import (
+            MEMORY_SECTIONS,
+            list_scope_sections,
+            render_section_text,
+        )
 
         project_path = str((project or Path(".")).resolve())
-        db = _get_db()
-        await db.connect()
+        project_name = Path(project_path).name
+        scope_payload: dict[str, Any] = {"name": project_name, "path": project_path}
+        memory_payload: dict[str, Any] | None = None
+        content = ""
+
+        canonical_id = ""
         try:
-            await apply_schema(db)
-            scope = await _resolve_scope(db, project_path)
-            if not scope:
-                if format_mode == "inject":
-                    return  # Silent for hook injection
-                if json_output:
-                    print(json_mod.dumps({"error": "no_scope", "project": project_path}))
-                else:
-                    console.print(f"[yellow]No scope found for:[/yellow] {project_path}")
-                return
+            canonical_id = resolve_canonical_id(Path(project_path))
+        except Exception:
+            canonical_id = ""
 
-            scope_id = str(scope["id"])
-            memory = await get_working_memory(db, scope_id)
-            if not memory:
-                if format_mode == "inject":
-                    return  # Silent for hook injection
-                if json_output:
-                    print(
-                        json_mod.dumps(
-                            {
-                                "error": "no_memory",
-                                "scope": _sanitize_record(scope),
-                            }
+        if canonical_id:
+            repo_sections = list_scope_sections(
+                canonical_id=canonical_id,
+                display_name=project_name,
+                scope_path=project_path,
+            )
+            repo_parts = []
+            for section in MEMORY_SECTIONS:
+                entries = repo_sections.get(section, [])
+                rendered = render_section_text(entries)
+                if rendered:
+                    title = section.replace("_", " ").title()
+                    repo_parts.append(f"# {title}\n\n{rendered}")
+            if repo_parts:
+                content = "\n\n".join(repo_parts)
+                scope_payload["canonical_id"] = canonical_id
+                memory_payload = {
+                    "id": f"memory_repo:{canonical_id}",
+                    "content": content,
+                    "created_at": "",
+                    "metadata": {"method": "memory_repo"},
+                }
+
+        if not content:
+            from .db.queries import get_working_memory
+            from .db.schema import apply_schema
+
+            db = _get_db()
+            await db.connect()
+            try:
+                await apply_schema(db)
+                scope = await _resolve_scope(db, project_path)
+                if not scope:
+                    if format_mode == "inject":
+                        return  # Silent for hook injection
+                    if json_output:
+                        print(json_mod.dumps({"error": "no_scope", "project": project_path}))
+                    else:
+                        console.print(f"[yellow]No scope found for:[/yellow] {project_path}")
+                    return
+
+                scope_payload = _sanitize_record(scope)
+                scope_id = str(scope["id"])
+                memory = await get_working_memory(db, scope_id)
+                if not memory:
+                    if format_mode == "inject":
+                        return  # Silent for hook injection
+                    if json_output:
+                        print(
+                            json_mod.dumps(
+                                {
+                                    "error": "no_memory",
+                                    "scope": _sanitize_record(scope),
+                                }
+                            )
                         )
-                    )
-                else:
-                    console.print("[dim]No working memory for this project yet.[/dim]")
-                    console.print("[dim]Run: uc memory refresh --project .[/dim]")
-                return
+                    else:
+                        console.print("[dim]No working memory for this project yet.[/dim]")
+                        console.print("[dim]Run: uc memory refresh --project .[/dim]")
+                    return
+                content = memory.get("content", "")
+                memory_payload = memory
+            finally:
+                await db.close()
 
-            content = memory.get("content", "")
+        if json_output:
+            print(
+                json_mod.dumps(
+                    {
+                        **_sanitize_record(memory_payload or {}),
+                        "scope": scope_payload,
+                    },
+                    default=str,
+                )
+            )
+        elif format_mode == "inject":
+            # Raw markdown for hook injection — no Rich formatting
+            print(content)
+        else:
+            from rich.markdown import Markdown
+            from rich.panel import Panel
 
-            if json_output:
-                print(
-                    json_mod.dumps(
-                        {
-                            **_sanitize_record(memory),
-                            "scope": _sanitize_record(scope),
-                        },
-                        default=str,
-                    )
+            console.print(
+                Panel(
+                    Markdown(content),
+                    title=f"Working Memory: {scope_payload.get('name', '')}",
+                    border_style="blue",
                 )
-            elif format_mode == "inject":
-                # Raw markdown for hook injection — no Rich formatting
-                print(content)
-            else:
-                from rich.markdown import Markdown
-                from rich.panel import Panel
-
-                console.print(
-                    Panel(
-                        Markdown(content),
-                        title=f"Working Memory: {scope.get('name', '')}",
-                        border_style="blue",
-                    )
-                )
-                created = str(memory.get("created_at", ""))[:19]
-                method = memory.get("metadata", {}).get("method", "")
-                console.print(
-                    f"[dim]Updated: {created}  Method: {method}  ID: {memory.get('id')}[/dim]"
-                )
-        finally:
-            await db.close()
+            )
+            created = str(memory_payload.get("created_at", ""))[:19] if memory_payload else ""
+            method = memory_payload.get("metadata", {}).get("method", "") if memory_payload else ""
+            memory_id = memory_payload.get("id", "") if memory_payload else ""
+            console.print(
+                f"[dim]Updated: {created}  Method: {method}  ID: {memory_id}[/dim]"
+            )
 
     _run_async(_show())
 
@@ -1903,6 +2378,41 @@ def memory_refresh(
     _run_async(_refresh())
 
 
+def _split_legacy_working_memory(raw: str) -> list[tuple[str, str]]:
+    import re
+
+    title_re = re.compile(r"^##\s+(?P<title>.+)$")
+
+    def classify(title: str) -> str:
+        lowered = title.lower()
+        if "architecture" in lowered:
+            return "architecture"
+        if "gotcha" in lowered or "learned" in lowered:
+            return "state"
+        if "current" in lowered or "recent" in lowered or "active" in lowered:
+            return "state"
+        return "state"
+
+    current_title = "state"
+    current_body: list[str] = []
+    blocks: list[tuple[str, str]] = []
+
+    for line in raw.splitlines():
+        m = title_re.match(line.strip())
+        if not m:
+            current_body.append(line)
+            continue
+
+        if any(token.strip() for token in current_body):
+            blocks.append((classify(current_title), "\n".join(current_body).strip()))
+            current_body = []
+        current_title = m.group("title")
+
+    if any(token.strip() for token in current_body):
+        blocks.append((classify(current_title), "\n".join(current_body).strip()))
+    return blocks
+
+
 @memory_app.command("sync")
 def memory_sync(
     project: Path | None = typer.Option(
@@ -1921,6 +2431,762 @@ def memory_sync(
     """Refresh project memory, then inject it into a target file."""
     memory_refresh(project=project, json_output=False)
     memory_inject(project=project, target=target)
+
+
+@memory_app.command("migrate-db")
+def memory_migrate_db(
+    project: Path | None = typer.Option(
+        None,
+        "--project",
+        "-p",
+        help="Migrate one scope (default: cwd)",
+    ),
+    all_scopes: bool = typer.Option(
+        False,
+        "--all",
+        help="Migrate all scopes from DB.",
+    ),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output as JSON"),
+) -> None:
+    """Migrate existing DB working-memory into canonical memory files."""
+
+    async def _migrate():
+        import hashlib
+        from pathlib import Path as _Path
+
+        from .db.queries import get_working_memory, list_scopes
+        from .db.schema import apply_schema
+        from .git import resolve_canonical_id
+        from .memory_repo import (
+            MEMORY_SECTIONS,
+            append_section_entry,
+            get_memory_migrations_root,
+            read_section_entries,
+        )
+
+        project_path = (project or _Path(".")).resolve()
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+
+            if all_scopes:
+                target_scopes = await list_scopes(db)
+            else:
+                scope = await _resolve_scope(db, str(project_path))
+                if not scope:
+                    if json_output:
+                        print(json_mod.dumps({"error": "no_scope", "project": str(project_path)}))
+                    else:
+                        console.print(f"[yellow]No scope found for:[/yellow] {project_path}")
+                    return
+                target_scopes = [scope]
+
+            migrated: list[str] = []
+            skipped: list[str] = []
+            failed: list[dict[str, str]] = []
+            migration_root = get_memory_migrations_root()
+            migration_root.mkdir(parents=True, exist_ok=True)
+
+            for scope in target_scopes:
+                scope_id = str(scope["id"])
+                memory = await get_working_memory(db, scope_id)
+                if not memory:
+                    skipped.append(scope_id)
+                    continue
+
+                scope_name = str(scope.get("name") or "project")
+                scope_path = str(scope.get("path") or project_path)
+                canonical_id = scope.get("canonical_id") or resolve_canonical_id(_Path(scope_path))
+                if not canonical_id:
+                    failed.append(
+                        {"scope_id": scope_id, "reason": "missing canonical_id"}
+                    )
+                    continue
+
+                marker_id = hashlib.sha1(str(canonical_id).encode("utf-8")).hexdigest()[:16]
+                marker = migration_root / f"{marker_id}.json"
+                if marker.exists():
+                    skipped.append(scope_id)
+                    continue
+
+                content = memory.get("content", "")
+                if not isinstance(content, str):
+                    content = str(content or "")
+                if not content.strip():
+                    failed.append(
+                        {
+                            "scope_id": scope_id,
+                            "canonical_id": str(canonical_id),
+                            "reason": "empty working memory",
+                        }
+                    )
+                    continue
+
+                blocks = _split_legacy_working_memory(content)
+                wrote = False
+                for section, block in blocks:
+                    if section not in MEMORY_SECTIONS:
+                        section = "state"
+                    if not block.strip():
+                        continue
+                    existing = read_section_entries(
+                        canonical_id=canonical_id,
+                        section=section,
+                        display_name=scope_name,
+                        scope_path=scope_path,
+                    )
+                    duplicate = any(
+                        e.get("source") == "migrated_db"
+                        and e.get("content", "").strip() == block.strip()
+                        and str(e.get("scope_canonical_id")) == canonical_id
+                        for e in existing
+                    )
+                    if duplicate:
+                        continue
+                    append_section_entry(
+                        canonical_id=canonical_id,
+                        section=section,
+                        display_name=scope_name,
+                        content=block.strip(),
+                        memory_type="durable_fact",
+                        confidence=0.8,
+                        manual=False,
+                        source="migrated_db",
+                        scope_path=scope_path,
+                    )
+                    wrote = True
+
+                if wrote:
+                    marker.write_text(
+                        json_mod.dumps(
+                            {"scope_id": scope_id, "canonical_id": canonical_id},
+                        ),
+                        encoding="utf-8",
+                    )
+                    migrated.append(scope_id)
+                else:
+                    skipped.append(scope_id)
+
+            if json_output:
+                print(
+                    json_mod.dumps(
+                        {
+                            "migrated": migrated,
+                            "skipped": skipped,
+                            "failed": failed,
+                            "ok": not failed,
+                        }
+                    )
+                )
+            else:
+                if migrated:
+                    console.print(f"[green]Migrated scopes:[/green] {len(migrated)}")
+                if skipped:
+                    console.print(f"[dim]Skipped scopes:[/dim] {len(skipped)}")
+                if failed:
+                    console.print(f"[red]Failed migrations:[/red] {len(failed)}")
+                    for item in failed:
+                        console.print(f"  - {item['scope_id']}: {item['reason']}")
+            if failed:
+                raise typer.Exit(code=1)
+        finally:
+            await db.close()
+
+    _run_async(_migrate())
+
+
+def _infer_remember_type(section: str, text: str) -> str:
+    """Fast deterministic memory-type inference for `uc remember`."""
+    normalized = text.lower()
+    if section == "procedures":
+        return "procedure"
+    if section == "preferences":
+        return "decision"
+    if section == "open_questions":
+        return "open_question"
+    if "why" in normalized or "decision" in normalized or "chose" in normalized:
+        return "decision"
+    if "how" in normalized and "do" in normalized:
+        return "procedure"
+    return "durable_fact"
+
+
+def _infer_remember_section(section: str, memory_type: str) -> str:
+    """Derive section when explicit section inference is requested."""
+    inferred_type = memory_type if memory_type else "durable_fact"
+    if section not in ("auto",):
+        return section
+
+    if inferred_type == "procedure":
+        return "procedures"
+    if inferred_type == "decision":
+        return "preferences"
+    if inferred_type == "open_question":
+        return "open_questions"
+    return "state"
+
+
+def _coerce_evidence_payload(payload: Any) -> list[dict[str, str]]:
+    """Convert one evidence payload into canonical evidence rows."""
+    if isinstance(payload, dict):
+        normalized: dict[str, str] = {}
+        for key, value in payload.items():
+            if not isinstance(key, str):
+                continue
+            k = key.strip().lower()
+            if k in {"artifact", "artifact_id", "artifactid"}:
+                k = "artifact_id"
+            elif k in {"run", "run_id"}:
+                k = "run_id"
+            elif k in {"turn", "turn_id"}:
+                k = "turn_id"
+            elif k in {"session", "session_id"}:
+                k = "session_id"
+            else:
+                continue
+
+            if not isinstance(value, str):
+                value = str(value)
+            value = value.strip()
+            if not value:
+                continue
+            normalized[k] = value
+        return [normalized] if normalized else []
+
+    if isinstance(payload, (int, float, str)):
+        text = str(payload).strip()
+        if not text:
+            return []
+        if ":" in text:
+            key, value = [part.strip() for part in text.split(":", 1)]
+            if not value:
+                return []
+            if key in {"artifact", "artifact_id", "artifactid"}:
+                return [{"artifact_id": value}]
+            if key in {"run", "run_id"}:
+                return [{"run_id": value}]
+            if key in {"turn", "turn_id"}:
+                return [{"turn_id": value}]
+            if key in {"session", "session_id"}:
+                return [{"session_id": value}]
+
+        return [{"artifact_id": text}]
+
+    if isinstance(payload, list):
+        rows: list[dict[str, str]] = []
+        for item in payload:
+            rows.extend(_coerce_evidence_payload(item))
+        return rows
+
+    return []
+
+
+def _parse_remember_evidence(items: list[str] | None) -> list[dict[str, str]]:
+    """Parse evidence input as JSON, CSV, or repeated legacy IDs."""
+    import csv
+
+    if not items:
+        return []
+
+    rows: list[dict[str, str]] = []
+    for raw in items:
+        if not raw:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+
+        parsed: Any | None = None
+        try:
+            parsed = json_mod.loads(text)
+        except json_mod.JSONDecodeError:
+            parsed = None
+
+        if parsed is not None:
+            rows.extend(_coerce_evidence_payload(parsed))
+            continue
+
+        for row in csv.reader([text], skipinitialspace=True):
+            for token in row:
+                token = token.strip()
+                if not token:
+                    continue
+                rows.extend(_coerce_evidence_payload(token))
+
+    dedup: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if not row:
+            continue
+        dedup[json_mod.dumps(row, sort_keys=True)] = row
+    return list(dedup.values())
+
+
+def _normalize_remember_confidence(value: Any, fallback: float = 0.85) -> float:
+    """Clamp confidence into [0.0, 1.0] and normalize fallback on bad values."""
+    try:
+        value_num = float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+    if value_num < 0.0:
+        return 0.0
+    if value_num > 1.0:
+        return 1.0
+    return value_num
+
+
+def _normalize_skill_title(content: str) -> str:
+    """Build a human title for a promoted skill from memory content."""
+    first_line = content.strip().splitlines()[0].strip("- ").strip()
+    if not first_line:
+        return "Promoted Procedure"
+
+    title = first_line.replace("#", "").strip()
+    if len(title) <= 80:
+        return title
+    return f"{title[:77]}..."
+
+
+def _render_provenance_rows(entries: list[dict[str, Any]]) -> list[str]:
+    """Normalize and stringify evidence rows into readable bullets."""
+    rendered: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        parts: list[str] = []
+        for key in ("artifact_id", "run_id", "turn_id", "session_id"):
+            value = entry.get(key)
+            if value:
+                parts.append(f"{key}:{value}")
+        if parts:
+            rendered.append(" - " + ", ".join(parts))
+    if not rendered:
+        return ["- No provenance identifiers present."]
+    return rendered
+
+
+@app.command("remember")
+@memory_app.command("remember")
+def memory_remember(
+    content: str = typer.Argument(..., help="Memory payload"),
+    project: Path = typer.Option(
+        ...,
+        "--project",
+        "-p",
+        help="Project path (required).",
+    ),
+    section: str = typer.Option(
+        "auto",
+        "--section",
+        "-s",
+        help=(
+            "Section: architecture, state, procedures, preferences, open_questions. "
+            "Use auto to infer section from type."
+        ),
+    ),
+    memory_type: str = typer.Option(
+        ...,
+        "--type",
+        "-t",
+        help=(
+            "Entry type (required): durable_fact, procedure, decision, open_question."
+        ),
+    ),
+    confidence: float = typer.Option(
+        0.85,
+        "--confidence",
+        min=0.0,
+        max=1.0,
+        help="Confidence score 0.0-1.0.",
+    ),
+    produced_by_model: str = typer.Option(
+        "manual",
+        "--produced-by-model",
+        help="Source model or actor.",
+    ),
+    source: str = typer.Option(
+        "remember",
+        "--source",
+        help="Evidence source label (distilled, remember, migrated_db, import).",
+    ),
+    evidence: list[str] = typer.Option(
+        None,
+        "--evidence",
+        help="Evidence IDs (e.g. artifact:abc123). Can be repeated.",
+    ),
+) -> None:
+    """Append a deterministic memory entry directly into durable memory files."""
+    from .git import resolve_canonical_id
+    from .memory_repo import MEMORY_SECTIONS, append_section_entry
+
+    normalized_section = section.strip().lower() or "auto"
+    if normalized_section != "auto" and normalized_section not in MEMORY_SECTIONS:
+        raise typer.BadParameter(
+            f"Invalid section '{section}'. Expected one of {', '.join(MEMORY_SECTIONS)} or auto."
+        )
+
+    normalized_type = memory_type.strip().lower() if isinstance(memory_type, str) else ""
+    allowed_types = ("durable_fact", "procedure", "decision", "open_question")
+    if normalized_type not in allowed_types:
+        raise typer.BadParameter(
+            f"Invalid --type '{memory_type}'. Expected one of {', '.join(allowed_types)}."
+        )
+    memory_type = normalized_type
+
+    resolved_section = _infer_remember_section(normalized_section, memory_type)
+    if normalized_section == "auto" and resolved_section != normalized_section:
+        section = resolved_section
+    else:
+        section = normalized_section
+
+    scope_path = project.resolve()
+    canonical_id = resolve_canonical_id(scope_path)
+    if not canonical_id:
+        raise typer.BadParameter(f"Unable to resolve canonical scope id for project: {scope_path}")
+    display_name = scope_path.name
+
+    parsed_evidence = _parse_remember_evidence(evidence)
+    normalized_confidence = _normalize_remember_confidence(confidence)
+
+    append_section_entry(
+        canonical_id=canonical_id,
+        section=section,
+        display_name=display_name,
+        content=content,
+        memory_type=memory_type,
+        confidence=normalized_confidence,
+        manual=True,
+        source=source.strip() or "remember",
+        produced_by_model=produced_by_model,
+        evidence=parsed_evidence,
+        scope_path=str(scope_path),
+    )
+
+    console.print("[green]Remembered entry written to durable memory[/green]")
+
+
+def _normalize_repo_target(project: Path | None) -> str | None:
+    """Normalize a project path to the canonical-id form used by memory scope registry."""
+    if project is None:
+        return None
+    from .git import resolve_canonical_id
+    from .memory_repo import normalize_canonical_id
+
+    return normalize_canonical_id(resolve_canonical_id(project))
+
+
+def _collect_memory_repo_scopes(
+    project: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Load memory scope records from scope-map, optionally filtered by project."""
+    from .memory_repo import list_scope_registry, normalize_canonical_id
+
+    records = list_scope_registry()
+    if not records:
+        return []
+
+    if project is None:
+        return [record.__dict__ for record in records]
+
+    target = _normalize_repo_target(project)
+    if not target:
+        return []
+
+    project_path = str(project.resolve())
+    matched: list[dict[str, Any]] = []
+    for record in records:
+        candidates = [record.canonical_id, record.canonical_url, record.remote_url, record.path]
+        if any(normalize_canonical_id(candidate or "") == target for candidate in candidates):
+            matched.append(record.__dict__)
+            continue
+        if record.path == project_path:
+            matched.append(record.__dict__)
+    return matched
+
+
+def _gather_scope_entries(
+    scope_record: dict[str, Any],
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]], int]:
+    """Load all section entries for a scoped memory repo row."""
+    from .memory_repo import list_scope_sections
+
+    canonical_id = scope_record["canonical_id"]
+    display_name = str(
+        scope_record.get("display_name")
+        or scope_record.get("scope_name")
+        or "project"
+    )
+    sections = list_scope_sections(
+        canonical_id=canonical_id,
+        display_name=display_name,
+        scope_path=scope_record.get("path"),
+    )
+    flat_entries = [entry for entries in sections.values() for entry in entries]
+    total = sum(len(entries) for entries in sections.values())
+    return sections, flat_entries, total
+
+
+def _derive_probe_text(entries: list[dict[str, Any]]) -> str:
+    """Derive a short probe phrase from the first durable memory entry."""
+    import re
+
+    for entry in entries:
+        content = str(entry.get("content", "")).strip()
+        if not content:
+            continue
+        tokens = [token.lower() for token in re.findall(r"[A-Za-z0-9_/#.:+-]+", content)]
+        if len(tokens) >= 2:
+            return " ".join(tokens[:6])
+        return content[:60]
+    return ""
+
+
+def _build_scope_index(scope_records: list[dict[str, Any]]) -> dict[str, str]:
+    """Build canonical-id lookup for DB scopes."""
+    from .memory_repo import normalize_canonical_id
+
+    index: dict[str, str] = {}
+    for scope in scope_records:
+        scope_id = str(scope.get("id", ""))
+        if not scope_id:
+            continue
+
+        canonical_id = normalize_canonical_id(
+            str(scope.get("canonical_id") or scope.get("path") or "")
+        )
+        if canonical_id:
+            index[canonical_id] = scope_id
+
+    return index
+
+
+@admin_app.command("promote-skills")
+def promote_skills(
+    project: Path | None = typer.Option(
+        None,
+        "--project",
+        "-p",
+        help="Single project scope to inspect (default: all)",
+    ),
+    min_occurrences: int = typer.Option(
+        2,
+        "--min-occurrences",
+        help="Minimum repeated mentions before promoting a procedure.",
+    ),
+    min_confidence: float = typer.Option(
+        0.8,
+        "--min-confidence",
+        min=0.0,
+        max=1.0,
+        help="Minimum average confidence for promotion candidates.",
+    ),
+    min_evidence: int = typer.Option(
+        1,
+        "--min-evidence",
+        help="Minimum evidence rows across matching entries.",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Dry run only; do not write files."),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing skill files."),
+) -> None:
+    """Promote stable procedural memories into durable skill artifacts."""
+    import hashlib
+    import re
+
+    from .db.queries import list_scopes
+    from .db.schema import apply_schema
+    from .git import resolve_canonical_id
+    from .memory_repo import get_memory_skills_root, list_scope_sections, slugify_name
+
+    normalized_min_conf = _normalize_remember_confidence(min_confidence, fallback=0.8)
+
+    async def _promote() -> None:
+        db = _get_db()
+        await db.connect()
+        try:
+            await apply_schema(db)
+
+            if project:
+                scope = await _resolve_scope(db, str((project).resolve()))
+                scopes = [scope] if scope else []
+            else:
+                scopes = await list_scopes(db)
+
+            total_candidates = 0
+            total_promoted = 0
+            total_skipped = 0
+
+            for scope in scopes:
+                if not scope:
+                    continue
+                scope_id = str(scope.get("id", ""))
+                scope_name = str(scope.get("name", "project"))
+                scope_path = scope.get("path")
+                canonical_id = scope.get("canonical_id")
+                if not canonical_id and scope_path:
+                    canonical_id = resolve_canonical_id(Path(scope_path))
+                if not canonical_id:
+                    total_skipped += 1
+                    continue
+
+                sections = list_scope_sections(
+                    canonical_id=canonical_id,
+                    display_name=scope_name,
+                    scope_path=scope_path or str((project or Path(".")).resolve()),
+                )
+                entries = sections.get("procedures", [])
+                if not entries:
+                    continue
+
+                grouped: dict[str, dict[str, Any]] = {}
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    content = str(entry.get("content", "")).strip()
+                    if not content:
+                        continue
+                    memory_type = entry.get("type", "durable_fact")
+                    if memory_type != "procedure":
+                        continue
+
+                    conf = _normalize_remember_confidence(entry.get("confidence"), fallback=0.0)
+                    evidence = entry.get("evidence", [])
+
+                    key = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                    bucket = grouped.setdefault(
+                        key,
+                        {
+                            "content": content,
+                            "count": 0,
+                            "confidence_total": 0.0,
+                            "max_confidence": 0.0,
+                            "evidence": [],
+                            "sources": [],
+                        },
+                    )
+                    bucket["count"] += 1
+                    bucket["confidence_total"] += conf
+                    if conf > bucket["max_confidence"]:
+                        bucket["max_confidence"] = conf
+                    if evidence:
+                        bucket["evidence"].extend(
+                            item for item in evidence if isinstance(item, dict)
+                        )
+                    bucket["sources"].append(
+                        {
+                            "id": str(entry.get("entry_id", "")),
+                            "scope_id": scope_id,
+                            "scope_canonical_id": str(entry.get("scope_canonical_id", "")),
+                            "produced_by_model": str(entry.get("produced_by_model", "")),
+                            "manual": bool(entry.get("manual", False)),
+                        }
+                    )
+
+                for bucket in grouped.values():
+                    count = bucket["count"]
+                    avg_confidence = (
+                        bucket["confidence_total"] / count if count else 0.0
+                    )
+                    evidence_count = len(bucket["evidence"])
+                    if (
+                        count < min_occurrences
+                        or avg_confidence < normalized_min_conf
+                        or evidence_count < min_evidence
+                    ):
+                        continue
+
+                    total_candidates += 1
+                    title = _normalize_skill_title(bucket["content"])
+                    title_hash = hashlib.md5(title.encode("utf-8")).hexdigest()[:8]
+                    slug = f"{slugify_name(title)}--{title_hash}"
+                    skill_dir = get_memory_skills_root() / slug
+                    skill_path = skill_dir / "SKILL.md"
+                    metadata_path = skill_dir / "metadata.yaml"
+
+                    if dry_run:
+                        console.print(
+                            f"[yellow]DRY[/yellow] {scope_name} -> {title} "
+                            f"(x{count}, conf={avg_confidence:.2f})"
+                        )
+                        continue
+
+                    if skill_path.exists() and not overwrite:
+                        total_skipped += 1
+                        continue
+
+                    skill_dir.mkdir(parents=True, exist_ok=True)
+                    provenance_lines = _render_provenance_rows(bucket["evidence"])
+                    metadata = {
+                        "type": "procedure",
+                        "name": title,
+                        "scope_id": scope_id,
+                        "scope_name": scope_name,
+                        "scope_canonical_id": canonical_id,
+                        "scope_path": scope_path,
+                        "occurrences": count,
+                        "max_confidence": bucket["max_confidence"],
+                        "avg_confidence": avg_confidence,
+                        "min_confidence": normalized_min_conf,
+                        "min_occurrences": min_occurrences,
+                        "min_evidence": min_evidence,
+                        "source_count": len(bucket["sources"]),
+                    }
+
+                    skill_steps = "\n".join(
+                        line
+                        for line in re.split(r"\n+", str(bucket["content"]).strip())
+                        if line.strip()
+                    )
+                    if skill_steps and not skill_steps.startswith("-"):
+                        skill_steps = "\n".join(
+                            f"- {line.strip()}" for line in skill_steps.splitlines() if line.strip()
+                        )
+
+                    skill_doc = (
+                        f"# {title}\n\n"
+                        f"- Scope: {scope_name}\n"
+                        f"- Canonical ID: {canonical_id}\n"
+                        f"- Occurrences: {count}\n"
+                        f"- Average confidence: {avg_confidence:.2f}\n"
+                        "- Version: 1\n\n"
+                        "## Preconditions\n\n"
+                        "- Validate runtime assumptions before running.\n\n"
+                        "## Steps\n\n"
+                        f"{skill_steps or '- Unknown (derive from procedure memory entries).'}\n\n"
+                        "## Validation\n\n"
+                        "- Confirm expected outcome and rollback criteria.\n\n"
+                        "## Failure Modes\n\n"
+                        "- Procedure drift due to changed architecture.\n"
+                        "- Missing inputs or invalid preconditions.\n"
+                        "- Tooling/API behavior changed since capture.\n\n"
+                        "## Provenance\n\n"
+                        + "\n".join(provenance_lines)
+                        + "\n"
+                    )
+
+                    skill_path.write_text(skill_doc, encoding="utf-8")
+                    import yaml
+
+                    metadata_path.write_text(
+                        yaml.safe_dump(metadata, sort_keys=False),
+                        encoding="utf-8",
+                    )
+                    total_promoted += 1
+                    console.print(f"[green]Promoted skill:[/green] {scope_name} / {title}")
+
+            console.print(f"[green]Skill promotion complete[/green]: {total_promoted} promoted")
+            if dry_run:
+                console.print(f"[dim]Candidates evaluated: {total_candidates}[/dim]")
+            if total_skipped:
+                console.print(f"[dim]Skipped existing: {total_skipped}[/dim]")
+            if total_promoted == 0:
+                console.print("[dim]No procedures met promotion thresholds.[/dim]")
+            if total_candidates == 0:
+                console.print("[dim]No promotion candidates found.[/dim]")
+        finally:
+            await db.close()
+
+    _run_async(_promote())
 
 
 @memory_app.command("history")
@@ -2069,48 +3335,86 @@ def memory_inject(
     """
 
     async def _inject():
-        from .db.queries import get_working_memory
-        from .db.schema import apply_schema
+        from .git import resolve_canonical_id
+        from .memory_repo import (
+            MEMORY_SECTIONS,
+            list_scope_sections,
+            render_section_text,
+        )
 
         project_path = (project or Path(".")).resolve()
-        db = _get_db()
-        await db.connect()
+        content = ""
+
+        canonical_id = ""
         try:
-            await apply_schema(db)
-            scope = await _resolve_scope(db, str(project_path))
-            if not scope:
-                console.print(f"[yellow]No scope found for:[/yellow] {project_path}")
-                return
+            canonical_id = resolve_canonical_id(project_path)
+        except Exception:
+            canonical_id = ""
 
-            scope_id = str(scope["id"])
-            memory = await get_working_memory(db, scope_id)
-            if not memory:
-                console.print(
-                    "[dim]No working memory yet. Run: uc memory refresh --project .[/dim]"
-                )
-                return
+        if canonical_id:
+            sections = list_scope_sections(
+                canonical_id=canonical_id,
+                display_name=project_path.name,
+                scope_path=str(project_path),
+            )
+            repo_parts = []
+            for section in MEMORY_SECTIONS:
+                entries = sections.get(section, [])
+                rendered = render_section_text(entries)
+                if rendered:
+                    title = section.replace("_", " ").title()
+                    repo_parts.append(f"# {title}\n\n{rendered}")
+            if repo_parts:
+                content = "\n\n".join(repo_parts)
 
-            content = memory.get("content", "")
-            memory_block = f"{_MEMORY_START}\n{content}\n{_MEMORY_END}"
+        if not content:
+            from .db.queries import get_working_memory
+            from .db.schema import apply_schema
 
-            target_path = project_path / target
-            if target_path.exists():
-                existing = target_path.read_text(encoding="utf-8")
-                # Replace existing memory section or append
-                if _MEMORY_START in existing:
-                    import re
+            db = _get_db()
+            await db.connect()
+            try:
+                await apply_schema(db)
+                scope = await _resolve_scope(db, str(project_path))
+                if not scope:
+                    console.print(f"[yellow]No scope found for:[/yellow] {project_path}")
+                    return
 
-                    pattern = re.escape(_MEMORY_START) + r".*?" + re.escape(_MEMORY_END)
-                    new_content = re.sub(pattern, memory_block, existing, flags=re.DOTALL)
-                else:
-                    new_content = existing.rstrip() + "\n\n" + memory_block + "\n"
+                scope_id = str(scope["id"])
+                memory = await get_working_memory(db, scope_id)
+                if not memory:
+                    console.print(
+                        "[dim]No working memory yet. Run: uc memory refresh --project .[/dim]"
+                    )
+                    return
+                content = memory.get("content", "")
+            finally:
+                await db.close()
+
+        if not content:
+            console.print(
+                "[dim]No working memory content yet. Run: uc memory refresh --project .[/dim]"
+            )
+            return
+
+        memory_block = f"{_MEMORY_START}\n{content}\n{_MEMORY_END}"
+
+        target_path = project_path / target
+        if target_path.exists():
+            existing = target_path.read_text(encoding="utf-8")
+            # Replace existing memory section or append
+            if _MEMORY_START in existing:
+                import re
+
+                pattern = re.escape(_MEMORY_START) + r".*?" + re.escape(_MEMORY_END)
+                new_content = re.sub(pattern, memory_block, existing, flags=re.DOTALL)
             else:
-                new_content = memory_block + "\n"
+                new_content = existing.rstrip() + "\n\n" + memory_block + "\n"
+        else:
+            new_content = memory_block + "\n"
 
-            target_path.write_text(new_content, encoding="utf-8")
-            console.print(f"[green]Injected working memory into[/green] {target_path.name}")
-        finally:
-            await db.close()
+        target_path.write_text(new_content, encoding="utf-8")
+        console.print(f"[green]Injected working memory into[/green] {target_path.name}")
 
     _run_async(_inject())
 

@@ -304,11 +304,16 @@ class TestBundle:
             "SELECT id FROM artifact WHERE kind = 'note' AND content = 'manual note'"
         )
         assert note_artifacts
-        note_id = str(note_artifacts[0]["id"])
-        produced_edges = await db.query(
-            f"SELECT in, out FROM produced WHERE out = {note_id}"
-        )
-        assert any(str(edge.get("in")) in imported_turn_ids for edge in produced_edges)
+        has_imported_note_edge = False
+        for note in note_artifacts:
+            note_id = str(note["id"])
+            produced_edges = await db.query(
+                f"SELECT in, out FROM produced WHERE out = {note_id}"
+            )
+            if any(str(edge.get("in")) in imported_turn_ids for edge in produced_edges):
+                has_imported_note_edge = True
+                break
+        assert has_imported_note_edge
 
         checkpoints = await list_checkpoints(db, imported_run_id)
         assert len(checkpoints) == 1

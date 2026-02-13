@@ -27,6 +27,20 @@ def _id_str(record: dict[str, Any]) -> str:
     return str(record["id"])
 
 
+async def _count_table_records(db: UCDatabase, table: str) -> int:
+    """Return row count for a Surreal table.
+
+    If the table does not exist or the query fails, returns 0.
+    """
+    try:
+        result = await db.query(f"SELECT count() as count FROM {table} GROUP ALL")
+        if result and isinstance(result[0], dict):
+            return int(result[0].get("count", 0))
+        return 0
+    except Exception:
+        return 0
+
+
 # ============================================================
 # SCOPE
 # ============================================================
@@ -345,6 +359,49 @@ async def find_runs_by_session_path(
         {"path": session_path},
     )
     return result if isinstance(result, list) else []
+
+
+async def clear_derived_data(
+    db: UCDatabase,
+    *,
+    include_scopes: bool = True,
+) -> dict[str, int]:
+    """Delete derived graph/index tables to rebuild from sources.
+
+    The function does not drop schema definitions. It removes records in this
+    order:
+    checkpoint_at -> depends_on -> produced -> contains -> checkpoint -> job ->
+    step -> artifact -> turn -> run -> scope.
+
+    If include_scopes is False, scope rows are preserved and child tables are
+    cleared anyway.
+    """
+    deleted: dict[str, int] = {}
+    order = (
+        "checkpoint_at",
+        "depends_on",
+        "produced",
+        "contains",
+        "checkpoint",
+        "job",
+        "step",
+        "artifact",
+        "turn",
+        "run",
+        "scope",
+    )
+    for table in order:
+        if table == "scope" and not include_scopes:
+            continue
+        deleted[table] = await _count_table_records(db, table)
+        try:
+            # Safe interpolation: `table` is selected only from the hardcoded
+            # `order` tuple above and never from user input.
+            await db.query(f"DELETE FROM {table}")
+        except Exception:
+            # Tables may not exist in legacy schema versions.
+            deleted[table] = 0
+    return deleted
 
 
 # ============================================================

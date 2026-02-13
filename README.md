@@ -259,6 +259,7 @@ The local model downloads ~600MB on first use and caches at `~/.cache/uc-models/
 uc "what changed in scope identity?"       # Intent-first: routes to `uc ask`
 uc ask "question" --project .              # Shallow Q&A
 uc ask "question" --project . --deep       # Agentic deep reasoning (DSPy RLM)
+uc remember "fact" --project . --type durable_fact
 uc find "query" --project .                # Unified retrieval (auto mode)
 uc find "query" --mode keyword             # BM25/substring retrieval
 uc find "query" --mode semantic            # Vector retrieval
@@ -276,6 +277,8 @@ uc doctor                                  # Health check
 uc memory show --project .                 # View distilled project memory
 uc memory refresh --project .              # Regenerate from latest sessions
 uc memory sync --project .                 # Refresh + inject (single command)
+uc memory migrate-db --project .           # One-time DB -> durable file migration
+uc memory remember "note" --project . --type procedure
 uc memory inject --project .               # Write into AGENTS.md
 uc memory inject -t CLAUDE.md              # Write into CLAUDE.md
 uc memory eject --project .                # Remove injected memory
@@ -308,6 +311,8 @@ uc admin share export run:abc123 -o bundle.json
 uc admin share import bundle.json --project .
 uc admin scope list --json
 uc admin rebuild-index
+uc admin db rebuild --json
+uc admin db prove --project . --json
 uc admin dashboard
 ```
 

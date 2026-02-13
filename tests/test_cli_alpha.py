@@ -139,6 +139,7 @@ def test_ask_auto_deep_when_shallow_context_missing(monkeypatch):
     monkeypatch.setattr(cli_mod, "_persist_reasoning_snapshot", fake_persist)
     monkeypatch.setattr("universal_context.db.schema.apply_schema", fake_apply_schema)
     monkeypatch.setattr("universal_context.db.queries.search_artifacts", fake_search_artifacts)
+    monkeypatch.setattr("universal_context.git.resolve_canonical_id", lambda _p: "")
 
     result = runner.invoke(cli_mod.app, ["ask", "question", "--json"])
     assert result.exit_code == 0

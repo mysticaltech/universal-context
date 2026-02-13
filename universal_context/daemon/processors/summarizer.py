@@ -10,6 +10,7 @@ vector on the summary artifact for semantic search.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from ...db.client import UCDatabase
@@ -20,6 +21,7 @@ from ...db.queries import (
     get_turn_artifacts,
     store_embedding,
 )
+from ...session_cache import read_cached_summary, write_summary_cache
 from .base import BaseProcessor
 
 logger = logging.getLogger(__name__)
@@ -35,10 +37,14 @@ class TurnSummarizer(BaseProcessor):
         llm_fn: Any | None = None,
         embed_fn: Any | None = None,
         max_chars: int = FALLBACK_SUMMARY_LENGTH,
+        use_cache: bool = True,
+        use_llm_on_cache_miss: bool = True,
     ) -> None:
         self._llm_fn = llm_fn
         self._embed_fn = embed_fn
         self._max_chars = max_chars
+        self._use_cache = use_cache
+        self._use_llm_on_cache_miss = use_llm_on_cache_miss
 
     async def process(
         self, db: UCDatabase, job: dict[str, Any]
@@ -70,28 +76,59 @@ class TurnSummarizer(BaseProcessor):
         if not content:
             return {"summary": "", "method": "empty"}
 
-        # Generate summary
-        if self._llm_fn is not None:
-            try:
-                summary = await self._llm_fn(content)
-                method = "llm"
-            except Exception as e:
-                logger.warning("LLM summarization failed, using fallback: %s", e)
-                summary = self._extractive_summary(content)
-                method = "extractive_fallback"
-        else:
-            summary = self._extractive_summary(content)
-            method = "extractive"
-
         # Resolve scope from turn's run for denormalized scope field
         scope_id = None
         run_ref = turn.get("run")
+        run_session_path = None
         if run_ref:
             run = await get_run(db, str(run_ref))
             if run:
                 scope_val = run.get("scope")
                 if scope_val:
                     scope_id = str(scope_val)
+                session_path = run.get("session_path")
+                if session_path:
+                    run_session_path = Path(str(session_path))
+
+        sequence = int(turn.get("sequence") or 0)
+        summary = None
+        method = ""
+
+        # Sidecar cache is keyed by raw content hash + turn sequence.
+        if self._use_cache and run_session_path:
+            summary = read_cached_summary(
+                run_session_path,
+                sequence,
+                content,
+            )
+            if summary is not None:
+                method = "cache"
+
+        if summary is None:
+            # Generate a fresh summary
+            if self._llm_fn is not None and self._use_llm_on_cache_miss:
+                try:
+                    summary = await self._llm_fn(content)
+                    method = "llm"
+                except Exception as e:
+                    logger.warning("LLM summarization failed, using fallback: %s", e)
+                    summary = self._extractive_summary(content)
+                    method = "extractive_fallback"
+            else:
+                summary = self._extractive_summary(content)
+                method = "extractive"
+
+        if not summary:
+            return {"summary": "", "method": "empty", "length": 0, "embedded": False}
+
+        if self._use_cache and run_session_path and run_session_path.exists():
+            write_summary_cache(
+                session_file=run_session_path,
+                sequence=sequence,
+                raw_content=content,
+                summary=summary,
+                method=method,
+            )
 
         # Create derived artifact
         summary_id = await create_derived_artifact(
